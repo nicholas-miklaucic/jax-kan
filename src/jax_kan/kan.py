@@ -1,5 +1,6 @@
 """Flax modules defining the KAN and a single KAN layer."""
 
+import functools as ft
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Self
@@ -7,20 +8,15 @@ from typing import Callable, Optional, Self
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from eins import EinsOp
+from eins import Reductions as R
 from flax import linen as nn
 from jaxtyping import Array, Float
 
-from jax_kan.spline import design_matrix, eval_spline
+from jax_kan.spline import BSpline
 from jax_kan.typing_utils import class_tcheck, tcheck
-
-
-@class_tcheck
-@dataclass
-class KANLayerOutput:
-    y: Float[Array, ' out_dim']
-    postacts: Float[Array, ' out_dim in_dim']
-    postspline: Float[Array, ' out_dim in_dim']
+from jax_kan.utils import flax_summary
 
 
 @class_tcheck
@@ -39,16 +35,11 @@ class KANLayer(nn.Module):
 
     def setup(self):
         self.size = self.in_dim * self.out_dim
-        n_grid = len(self.knots)
         self.grid = self.knots
 
-        def spline_init(*args, **kwargs):
-            noise = self.kernel_init(*args, **kwargs)
-            # debug_structure(grid=self.grid, noise=noise)
-            # return curve2coef(self.grid.T, noise.T, self.grid, self.order)
-            return noise
+        self.spline = BSpline(self.grid, self.order)
+        self.coefs = nn.DenseGeneral(features=self.out_dim, use_bias=False)
 
-        self.coef = self.param('coef', spline_init, (self.size, n_grid + self.order - 1))
         if self.resid_scale_trainable:
             self.resid_scale = self.param('resid_scale', self.resid_scale_init, (self.size,))
         else:
@@ -61,23 +52,17 @@ class KANLayer(nn.Module):
 
         self.dropout = nn.Dropout(self.dropout_rate)
 
-    def full_output(self: Self, x: Float[Array, 'in_dim'], training: bool = False) -> KANLayerOutput:
-        # splines: (out_dim in_dim)
-        x = jnp.tile(x, (self.out_dim, 1)).reshape(-1)
-        y = jax.vmap(eval_spline, in_axes=(0, None, 0, None))(jnp.tanh(x), self.grid, self.coef, self.order)
-        postspline = y.reshape(self.out_dim, self.in_dim)
-
-        y = self.resid_scale * self.base_act(x) + self.spline_scale * y
-        postacts = y.reshape(self.out_dim, self.in_dim)
-
+    def __call__(self: Self, x: Float[Array, 'in_dim'], training: bool = False) -> Float[Array, ' out_dim']:
+        dm = jax.vmap(self.spline.design_matrix)(jnp.tanh(x))
+        # in coefs
+        y = self.coefs(dm)
+        # in_dim, out_dim
+        y = self.resid_scale * self.base_act(x[..., None]) + self.spline_scale * y
         y = self.dropout(y, deterministic=not training)
-        y = EinsOp('(out in) -> out', reduce='mean', symbol_values={'out': self.out_dim})(y)
+        # y = EinsOp('in out -> out', reduce='mean')(y)
+        y = R.mean(y, axis=0)
 
-        return KANLayerOutput(y=y, postacts=postacts, postspline=postspline)
-
-    def __call__(self: Self, x: Float[Array, 'batch in_dim'], training: bool = False) -> Float[Array, 'batch out_dim']:
-        out = lambda x: self.full_output(x, training=training).y
-        return jax.vmap(out)(x)
+        return y
 
 
 @class_tcheck
@@ -92,7 +77,7 @@ class KAN(nn.Module):
     layer_dropout_rate: float = 0.0
     hidden_dim: Optional[int] = None
     out_hidden_dim: Optional[int] = None
-    normalization: Callable = nn.LayerNorm
+    normalization: type[nn.Module] = nn.BatchNorm
     layer_templ: KANLayer = KANLayer(in_dim=1, out_dim=1)
     final_act: Callable = lambda x: x
 
@@ -104,19 +89,12 @@ class KAN(nn.Module):
         out_dim = self.out_hidden_dim or self.out_dim
         out_dims = (*self.inner_dims, out_dim)
 
-        knot_start = jnp.linspace(-1, 1, self.n_grid, dtype=self.knot_dtype)[1:-1]
-        knot_start = jnp.sign(knot_start) * jnp.sqrt(jnp.abs(knot_start))
-        if self.train_knots:
-            self.knots = self.param(
-                'knots',
-                lambda _rng, _shape: knot_start,
-                (in_dim,),
-            )
-        else:
-            self.knots = knot_start
+        knot_init = np.linspace(-1, 1, self.n_grid, dtype=self.knot_dtype)
+        knot_init = np.sign(knot_init) * np.sqrt(np.abs(knot_init))
+        self.knots = knot_init
 
         for out_dim in out_dims:
-            layers.append(self.layer_templ.copy(in_dim=in_dim, out_dim=out_dim, knots=self.grid_points()))
+            layers.append(self.layer_templ.copy(in_dim=in_dim, out_dim=out_dim, knots=self.knots))
             norms.append(self.normalization())
             dropouts.append(nn.Dropout(self.layer_dropout_rate))
             in_dim = out_dim
@@ -136,31 +114,21 @@ class KAN(nn.Module):
         self.dropouts = dropouts
         self.network = nn.Sequential(self.layers)
 
-    def grid_points(self):
-        return jnp.concat([jnp.array([-1]), self.knots, jnp.array([1])])
-
-    def full_outputs(
-        self, x: Float[Array, 'in_dim'], training: bool = False
-    ) -> tuple[Float[Array, ' out_dim'], Sequence[KANLayerOutput]]:
-        outputs = []
+    def __call__(self, x: Float[Array, 'in_dim'], training: bool = False) -> Float[Array, ' out_dim']:
         curr_x = self.in_proj(x)
         for layer, norm, dropout in zip(self.layers, self.norms, self.dropouts):
             curr_x = norm(curr_x)
-            outputs.append(layer.full_output(curr_x, training=training))
-            curr_x = dropout(outputs[-1].y, deterministic=not training)
+            curr_x = layer(curr_x, training=training)
+            curr_x = dropout(curr_x, deterministic=not training)
         y = self.out_proj(curr_x)
         y = self.final_act(curr_x)
-        return y, outputs
-
-    def __call__(self, x: Float[Array, 'batch in_dim'], training: bool = False) -> Float[Array, 'batch out_dim']:
-        out = lambda b: self.full_outputs(b, training=training)[0]
-        return jax.vmap(out)(x)
+        return y
 
 
 if __name__ == '__main__':
     in_dim = 4
     rng = jr.key(0)
-    xtest = jr.normal(rng, (14, in_dim))
+    xtest = jr.normal(rng, (in_dim,))
 
     kan = KAN(in_dim=in_dim, out_dim=6, inner_dims=[5], hidden_dim=15, out_hidden_dim=12)
-    print(kan.tabulate(rng, xtest))
+    flax_summary(kan, x=xtest, compute_flops=True, compute_vjp_flops=True)

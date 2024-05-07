@@ -52,7 +52,7 @@ Source = "https://github.com/nicholas-miklaucic/jax-kan"
 path = "src/jax_kan/__about__.py"
 
 [tool.hatch.envs.default]
-dependencies = ["coverage[toml]>=6.5", "pytest", "scipy"]
+dependencies = ["coverage[toml]>=6.5", "pytest", "scipy", "humanize"]
 
 [tool.hatch.envs.default.scripts]
 test = "pytest {args:tests}"

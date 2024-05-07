@@ -1,8 +1,8 @@
 import functools as ft
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from random import shuffle
-from typing import Callable
+from typing import Any, Callable
 
 import flax.linen as nn
 import jax
@@ -14,6 +14,7 @@ import pandas as pd
 import rich
 import rich.progress as rprog
 from eins import EinsOp
+from eins import ElementwiseOps as E
 from flax import struct
 from flax.training import train_state
 from jaxtyping import Array, Bool, Float
@@ -21,38 +22,65 @@ from rich.progress import Progress, track
 from rich.progress_bar import ProgressBar
 
 from jax_kan.kan import KANLayer
-from jax_kan.utils import Identity
+from jax_kan.utils import Identity, debug_structure, flax_summary
 
 console = rich.console.Console()
 
 # -------------------------------
 
-use_bandgap = True
+target = 'yield_featurized'
+loss_norm_fn = jnp.abs
 dataset_splits = (3, 4, 5, 6, 7)
-batch_size = 256
+batch_size = 16
 valid_prop = 0.2
 start_frac = 0.1
 end_frac = 0.2
 base_lr = 5e-3
-weight_decay = 0.01
+weight_decay = 0.03
 nesterov = True
 warmup = 10
-n_epochs = 150
+n_epochs = 500
 dtype = jnp.float32
+
+kwargs = {
+    'n_grid': 5,
+    'inner_dims': [128, 128],
+    'normalization': nn.LayerNorm,
+    'hidden_dim': None,
+    'out_hidden_dim': 1,
+    'train_knots': False,
+    'layer_templ': KANLayer(1, 1, order=2, dropout_rate=0.1, base_act=lambda x: jnp.tanh(x / 2)),
+}
 
 
 # -------------------------------
 
-df = pd.read_feather('datasets/mpc_full_feats_scaled_split.feather')
-df = df[df['dataset_split'].isin(dataset_splits)]
+target_transforms = {
+    'bandgap': lambda x: x,
+    'yield_raw': E.from_func(lambda x: E.expm1(x + 7.5)),
+    'delta_e': lambda x: x * 4,
+}
+
+target_transforms['yield_featurized'] = target_transforms['yield_raw']
+
+if target in ('bandgap', 'delta_e'):
+    df = pd.read_feather('datasets/mpc_full_feats_scaled_split.feather')
+    df = df[df['dataset_split'].isin(dataset_splits)]
+    df = df.select_dtypes('number').drop(columns=['TSNE_x', 'TSNE_y', 'umap_x', 'umap_y', 'dataset_split'])
+elif target == 'yield_raw':
+    df = pd.read_feather('datasets/steels_raw.feather')
+elif target == 'yield_featurized':
+    df = pd.read_feather('datasets/steels_featurized.feather')
+else:
+    msg = f'Unknown target: {target}'
+    raise ValueError(msg)
 
 valid_size = int(round(df.shape[0] * valid_prop / batch_size)) * batch_size
 valid_inds = np.random.default_rng(seed=123).choice(df.index, valid_size, replace=False)
 is_valid = df.index.isin(valid_inds)
-df = df.select_dtypes('number').drop(columns=['TSNE_x', 'TSNE_y', 'umap_x', 'umap_y', 'dataset_split'])
 
 
-if use_bandgap:
+if target == 'bandgap':
     # switch bandgap and delta_e
     df = df[[*df.columns[:-2], df.columns[-1], df.columns[-2]]]
 
@@ -74,8 +102,11 @@ steps_in_valid_epoch = datasets['valid'][0].shape[0] // batch_size
 @struct.dataclass
 class TrainBatch:
     X: Float[Array, 'batch in_dim']
-    delta_e: Float[Array, ' batch']
+    y: Float[Array, ' batch']
     mask: Bool[Array, ' batch']
+
+    def as_dict(self):
+        return {'X': self.X, 'y': self.y, 'mask': self.mask}
 
 
 def data_loader(split='train', infinite=True):
@@ -88,7 +119,7 @@ def data_loader(split='train', infinite=True):
     data_batches = jnp.split(data, n_splits)
     mas_batches = jnp.split(mas, n_splits)
 
-    batches = [TrainBatch(X=d[..., :-1], delta_e=d[..., -1], mask=m) for d, m in zip(data_batches, mas_batches)]
+    batches = [TrainBatch(X=d[..., :-1], y=d[..., -1], mask=m) for d, m in zip(data_batches, mas_batches)]
 
     first_time = True
     while first_time or infinite:
@@ -119,32 +150,51 @@ sched = optax.warmup_cosine_decay_schedule(
 )
 
 
-def create_train_state(model, rng):
-    params = model.init(rng, sample_batch.X, training=False)['params']
+class TrainState(train_state.TrainState):
+    pass
+
+
+def create_train_state(model: nn.Module, rng):
+    model_state = model.init(rng, jnp.ones((sample_batch.X.shape[1],)), training=False)
+    params = model_state.pop('params')
     tx = optax.adamw(sched, weight_decay=weight_decay, nesterov=nesterov)
-    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    return TrainState.create(apply_fn=model.apply, params=params, tx=tx, **model_state)
 
 
 steps_per_log = steps_in_epoch
 
 
 @ft.partial(jax.jit, static_argnames='training')
-def apply_model(state, batch: TrainBatch, training: bool, dropout_key):
+def apply_model(state: TrainState, batch: Mapping[str, jax.Array], training: bool, dropout_key):
     dropout_train_key = jr.fold_in(key=dropout_key, data=state.step)
 
     def loss_fn(params):
-        yhat = state.apply_fn({'params': params}, batch.X, training=training, rngs={'dropout': dropout_train_key})
-        err = jnp.abs(jnp.squeeze(yhat) - batch.delta_e) * batch.mask
-        return jnp.mean(err)
+        out = state.apply_fn(
+            {'params': params},
+            batch['X'],
+            training=training,
+            rngs={'dropout': dropout_train_key},
+            mutable=training,
+        )
 
-    grad_fn = jax.value_and_grad(loss_fn)
-    loss, grad = grad_fn(state.params)
-    return grad, loss
+        if training:
+            yhat, updates = out
+        else:
+            yhat = out
+            updates = {}
+
+        err = loss_norm_fn(jnp.squeeze(yhat) - batch['y']) * batch['mask']
+        return jnp.mean(err), updates
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss, updates), grad = grad_fn(state.params)
+    return grad, loss, updates
 
 
-@ft.partial(jax.jit)
-def step(state, grad):
-    return state.apply_gradients(grads=grad)
+def step(state, grad, updates):
+    state = state.apply_gradients(grads=grad)
+    state = state.replace(**updates)
+    return state
 
 
 def train_model(model: nn.Module):
@@ -174,9 +224,15 @@ def train_model(model: nn.Module):
             epoch_bar = prog.add_task(f'Train {epoch_i}...', total=steps_in_epoch)
             losses = []
             for _, batch in zip(range(steps_in_epoch), train_dl):
-                grad, loss = apply_model(state, batch, training=True, dropout_key=dropout_state)
+                grad, loss, updates = jax.vmap(
+                    lambda bat, state: apply_model(state, bat, training=True, dropout_key=dropout_state),
+                    in_axes=(
+                        {'X': 0, 'y': 0, 'mask': 0},
+                        None,
+                    ),
+                )(batch.as_dict(), state)
                 losses.append(loss)
-                state = step(state, grad)
+                state = step(state, grad, updates)
                 prog.update(epoch_bar, advance=1)
 
             train_loss = np.mean(losses)
@@ -184,7 +240,7 @@ def train_model(model: nn.Module):
             valid_bar = prog.add_task(f'Valid {epoch_i}...', total=steps_in_valid_epoch)
             losses = []
             for _, batch in zip(range(steps_in_valid_epoch), valid_dl):
-                grad, loss = apply_model(state, batch, training=False, dropout_key=dropout_state)
+                grad, loss, updates = apply_model(state, batch, training=False, dropout_key=dropout_state)
                 losses.append(loss)
                 prog.update(valid_bar, advance=1)
 
@@ -208,20 +264,9 @@ if __name__ == '__main__':
 
     from jax_kan.kan import KAN
 
-    kan = KAN(
-        in_dim=sample_batch.X.shape[-1],
-        out_dim=1,
-        n_grid=5,
-        inner_dims=[128],
-        normalization=ft.partial(Identity),
-        hidden_dim=128,
-        layer_dropout_rate=0.0,
-        out_hidden_dim=1,
-        train_knots=False,
-        layer_templ=KANLayer(1, 1, order=2, dropout_rate=0),
-    )
+    kan = KAN(in_dim=sample_batch.X.shape[-1], out_dim=1, final_act=target_transforms[target], **kwargs)
 
-    # console.print(kan.tabulate(jr.key(0), sample_batch.X, compute_flops=True, compute_vjp_flops=True))
+    flax_summary(kan, x=sample_batch.X[0], compute_flops=True, compute_vjp_flops=True)
 
     # mlp_state, mlp_epochs = train_model(mlp)
     kan_state, kan_epochs, duration = train_model(kan)
