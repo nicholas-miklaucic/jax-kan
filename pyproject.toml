@@ -34,6 +34,8 @@ dependencies = [
   "jax",
   "jaxtyping",
   "numpy",
+  "flax",
+  "pandas",
   "optax",
   "rich",
   "typing_extensions",
@@ -126,6 +128,9 @@ ignore = [
   "F722",
   # named lambdas are fine
   "E731",
+  # boolean arguments are fine
+  "FBT001",
+  "FBT002",
 ]
 unfixable = [
   # Don't touch unused imports

@@ -6,8 +6,10 @@ import numpy as np
 from scipy.interpolate import BSpline
 
 from jax_kan.spline import design_matrix, eval_spline
+from jax_kan.typing_utils import tcheck
 
 
+@tcheck
 def _test_eval_spline(seed):
     """Tests the eval_spline function."""
     rng = jax.random.key(seed)

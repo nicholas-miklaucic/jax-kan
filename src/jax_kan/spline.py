@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int
 
-from jax_kan.typing import tcheck
+from jax_kan.typing_utils import tcheck
 
 
 @tcheck
