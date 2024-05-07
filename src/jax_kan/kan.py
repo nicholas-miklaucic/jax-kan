@@ -25,12 +25,13 @@ class KANLayer(nn.Module):
     out_dim: int
     order: int = 2
     dropout_rate: float = 0.0
-    kernel_init: Callable = nn.initializers.normal(stddev=0.5)
-    resid_scale_trainable: bool = False
+    kernel_init: Callable = nn.initializers.normal(stddev=1)
+    resid_scale_trainable: bool = True
     resid_scale_init: Callable = nn.initializers.ones
     spline_scale_trainable: bool = False
-    spline_scale_init: Callable = nn.initializers.ones
+    spline_scale_init: Callable = nn.initializers.zeros
     base_act: Callable = nn.tanh
+    spline_input_map: Callable = jnp.tanh
     knots: Float[Array, ' grid'] = field(default_factory=lambda: jnp.array([-1, -0.5, 0, 0.5, 1]))
 
     def setup(self):
@@ -38,22 +39,22 @@ class KANLayer(nn.Module):
         self.grid = self.knots
 
         self.spline = BSpline(self.grid, self.order)
-        self.coefs = nn.DenseGeneral(features=self.out_dim, use_bias=False)
+        self.coefs = nn.Einsum((self.in_dim, self.out_dim, self.spline.n_coefs), 'ic,ioc->io', use_bias=False)
 
         if self.resid_scale_trainable:
-            self.resid_scale = self.param('resid_scale', self.resid_scale_init, (self.size,))
+            self.resid_scale = self.param('resid_scale', self.resid_scale_init, (self.in_dim, self.out_dim))
         else:
             self.resid_scale = 1
 
         if self.spline_scale_trainable:
-            self.spline_scale = self.param('spline_scale', self.spline_scale_init, (self.size,))
+            self.spline_scale = self.param('spline_scale', self.spline_scale_init, (self.in_dim, self.out_dim))
         else:
             self.spline_scale = 1
 
         self.dropout = nn.Dropout(self.dropout_rate)
 
     def __call__(self: Self, x: Float[Array, 'in_dim'], training: bool = False) -> Float[Array, ' out_dim']:
-        dm = jax.vmap(self.spline.design_matrix)(jnp.tanh(x))
+        dm = jax.vmap(self.spline.design_matrix)(self.spline_input_map(x))
         # in coefs
         y = self.coefs(dm)
         # in_dim, out_dim
@@ -71,13 +72,13 @@ class KAN(nn.Module):
     out_dim: int
     inner_dims: Sequence[int]
 
-    n_grid: int = 16
+    n_grid: int = 5
     knot_dtype: jnp.dtype = jnp.float32
     train_knots: bool = True
     layer_dropout_rate: float = 0.0
     hidden_dim: Optional[int] = None
     out_hidden_dim: Optional[int] = None
-    normalization: type[nn.Module] = nn.BatchNorm
+    normalization: type[nn.Module] = nn.LayerNorm
     layer_templ: KANLayer = KANLayer(in_dim=1, out_dim=1)
     final_act: Callable = lambda x: x
 
@@ -104,8 +105,8 @@ class KAN(nn.Module):
         else:
             self.in_proj = lambda x: x
 
-        if self.hidden_dim is not None:
-            self.out_proj = nn.Dense(self.out_dim, kernel_init=nn.initializers.ones, bias_init=nn.initializers.zeros)
+        if self.out_hidden_dim is not None:
+            self.out_proj = nn.DenseGeneral(self.out_dim)
         else:
             self.out_proj = lambda x: x
 
@@ -114,7 +115,7 @@ class KAN(nn.Module):
         self.dropouts = dropouts
         self.network = nn.Sequential(self.layers)
 
-    def __call__(self, x: Float[Array, 'in_dim'], training: bool = False) -> Float[Array, ' out_dim']:
+    def single_output(self, x: Float[Array, 'in_dim'], training: bool = False) -> Float[Array, ' out_dim']:
         curr_x = self.in_proj(x)
         for layer, norm, dropout in zip(self.layers, self.norms, self.dropouts):
             curr_x = norm(curr_x)
@@ -123,6 +124,9 @@ class KAN(nn.Module):
         y = self.out_proj(curr_x)
         y = self.final_act(curr_x)
         return y
+
+    def __call__(self, x: Float[Array, 'batch in_dim'], training: bool = False) -> Float[Array, ' batch out_dim']:
+        return jax.vmap(lambda single: self.single_output(single, training))(x)
 
 
 if __name__ == '__main__':

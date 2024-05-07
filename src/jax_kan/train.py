@@ -22,7 +22,7 @@ from rich.progress import Progress, track
 from rich.progress_bar import ProgressBar
 
 from jax_kan.kan import KANLayer
-from jax_kan.utils import Identity, debug_structure, flax_summary
+from jax_kan.utils import Identity, debug_stat, debug_structure, flax_summary
 
 console = rich.console.Console()
 
@@ -31,25 +31,38 @@ console = rich.console.Console()
 target = 'yield_featurized'
 loss_norm_fn = jnp.abs
 dataset_splits = (3, 4, 5, 6, 7)
-batch_size = 16
+batch_size = 32
 valid_prop = 0.2
-start_frac = 0.1
-end_frac = 0.2
+start_frac = 0.4
+end_frac = 0.01
 base_lr = 5e-3
-weight_decay = 0.03
+weight_decay = 0.04
 nesterov = True
 warmup = 10
-n_epochs = 500
+n_epochs = 1000
 dtype = jnp.float32
 
+
+n_grid = 12
+node_dropout = 0.2
+order = 3
+spline_input_map = lambda x: jnp.tanh(x)
+
 kwargs = {
-    'n_grid': 5,
-    'inner_dims': [128, 128],
-    'normalization': nn.LayerNorm,
-    'hidden_dim': None,
+    'n_grid': n_grid,
+    'inner_dims': [128, 96],
+    'normalization': ft.partial(nn.LayerNorm),
+    'hidden_dim': 128,
     'out_hidden_dim': 1,
     'train_knots': False,
-    'layer_templ': KANLayer(1, 1, order=2, dropout_rate=0.1, base_act=lambda x: jnp.tanh(x / 2)),
+    'layer_templ': KANLayer(
+        1,
+        1,
+        order=order,
+        dropout_rate=node_dropout,
+        base_act=lambda x: x,
+        spline_input_map=spline_input_map,
+    ),
 }
 
 
@@ -155,7 +168,7 @@ class TrainState(train_state.TrainState):
 
 
 def create_train_state(model: nn.Module, rng):
-    model_state = model.init(rng, jnp.ones((sample_batch.X.shape[1],)), training=False)
+    model_state = model.init(rng, sample_batch.X, training=False)
     params = model_state.pop('params')
     tx = optax.adamw(sched, weight_decay=weight_decay, nesterov=nesterov)
     return TrainState.create(apply_fn=model.apply, params=params, tx=tx, **model_state)
@@ -165,13 +178,13 @@ steps_per_log = steps_in_epoch
 
 
 @ft.partial(jax.jit, static_argnames='training')
-def apply_model(state: TrainState, batch: Mapping[str, jax.Array], training: bool, dropout_key):
+def apply_model(state: TrainState, batch: TrainBatch, training: bool, dropout_key):
     dropout_train_key = jr.fold_in(key=dropout_key, data=state.step)
 
     def loss_fn(params):
         out = state.apply_fn(
             {'params': params},
-            batch['X'],
+            batch.X,
             training=training,
             rngs={'dropout': dropout_train_key},
             mutable=training,
@@ -183,7 +196,7 @@ def apply_model(state: TrainState, batch: Mapping[str, jax.Array], training: boo
             yhat = out
             updates = {}
 
-        err = loss_norm_fn(jnp.squeeze(yhat) - batch['y']) * batch['mask']
+        err = loss_norm_fn(jnp.squeeze(yhat, -1) - batch.y) * batch.mask
         return jnp.mean(err), updates
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -191,9 +204,12 @@ def apply_model(state: TrainState, batch: Mapping[str, jax.Array], training: boo
     return grad, loss, updates
 
 
+@jax.jit
 def step(state, grad, updates):
     state = state.apply_gradients(grads=grad)
-    state = state.replace(**updates)
+    for k, v in updates.items():
+        if k != 'params':
+            state = state.replace(**{k: v})
     return state
 
 
@@ -224,13 +240,8 @@ def train_model(model: nn.Module):
             epoch_bar = prog.add_task(f'Train {epoch_i}...', total=steps_in_epoch)
             losses = []
             for _, batch in zip(range(steps_in_epoch), train_dl):
-                grad, loss, updates = jax.vmap(
-                    lambda bat, state: apply_model(state, bat, training=True, dropout_key=dropout_state),
-                    in_axes=(
-                        {'X': 0, 'y': 0, 'mask': 0},
-                        None,
-                    ),
-                )(batch.as_dict(), state)
+                grad, loss, updates = apply_model(state, batch, training=True, dropout_key=dropout_state)
+                # debug_stat(grad)
                 losses.append(loss)
                 state = step(state, grad, updates)
                 prog.update(epoch_bar, advance=1)
@@ -266,9 +277,14 @@ if __name__ == '__main__':
 
     kan = KAN(in_dim=sample_batch.X.shape[-1], out_dim=1, final_act=target_transforms[target], **kwargs)
 
-    flax_summary(kan, x=sample_batch.X[0], compute_flops=True, compute_vjp_flops=True)
+    sample_out, params = kan.init_with_output(jr.key(0), sample_batch.X)
 
-    # mlp_state, mlp_epochs = train_model(mlp)
+    # debug_stat(jnp.abs(sample_out.squeeze() - sample_batch.y))
+    # debug_structure(sample_out)
+    # debug_structure(params)
+
+    flax_summary(kan, x=sample_batch.X, compute_flops=True, compute_vjp_flops=True)
+
     kan_state, kan_epochs, duration = train_model(kan)
 
     table = Table(title='Run')
