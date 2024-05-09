@@ -41,6 +41,7 @@ dependencies = [
   "typing_extensions",
   "eins",
   "beartype",
+  "orthax",
 ]
 
 [project.urls]

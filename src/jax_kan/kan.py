@@ -14,7 +14,7 @@ from eins import Reductions as R
 from flax import linen as nn
 from jaxtyping import Array, Float
 
-from jax_kan.spline import BSpline
+from jax_kan.spline import BSpline, Jacobi
 from jax_kan.typing_utils import class_tcheck, tcheck
 from jax_kan.utils import flax_summary
 
@@ -24,9 +24,10 @@ class KANLayer(nn.Module):
     in_dim: int
     out_dim: int
     order: int = 2
+    n_coef: int = 5
     dropout_rate: float = 0.0
     kernel_init: Callable = nn.initializers.normal(stddev=1)
-    resid_scale_trainable: bool = True
+    resid_scale_trainable: bool = False
     resid_scale_init: Callable = nn.initializers.ones
     spline_scale_trainable: bool = False
     spline_scale_init: Callable = nn.initializers.zeros
@@ -38,13 +39,16 @@ class KANLayer(nn.Module):
         self.size = self.in_dim * self.out_dim
         self.grid = self.knots
 
-        self.spline = BSpline(self.grid, self.order)
-        self.coefs = nn.Einsum((self.in_dim, self.out_dim, self.spline.n_coefs), 'ic,ioc->io', use_bias=False)
+        # -1 < α < 1 are reasonable bounds, and 0 is Legendre
+        self.alpha_arctanh = self.param('alpha_arctanh', nn.initializers.zeros, ())
+
+        # self.spline = BSpline(self.grid, self.order)
+        self.coefs = nn.Einsum((self.in_dim, self.out_dim, self.n_coef), 'ic,ioc->io', use_bias=False)
 
         if self.resid_scale_trainable:
-            self.resid_scale = self.param('resid_scale', self.resid_scale_init, (self.in_dim, self.out_dim))
+            self.resid_scale = self.param('resid_scale', self.resid_scale_init, (self.in_dim, 1))
         else:
-            self.resid_scale = 1
+            self.resid_scale = 0
 
         if self.spline_scale_trainable:
             self.spline_scale = self.param('spline_scale', self.spline_scale_init, (self.in_dim, self.out_dim))
@@ -54,7 +58,10 @@ class KANLayer(nn.Module):
         self.dropout = nn.Dropout(self.dropout_rate)
 
     def __call__(self: Self, x: Float[Array, 'in_dim'], training: bool = False) -> Float[Array, ' out_dim']:
-        dm = jax.vmap(self.spline.design_matrix)(self.spline_input_map(x))
+        alpha = jnp.tanh(self.alpha_arctanh)
+        spline = Jacobi(alpha=alpha, beta=alpha, n_coefs=self.n_coef)
+
+        dm = jax.vmap(spline.design_matrix)(self.spline_input_map(x))
         # in coefs
         y = self.coefs(dm)
         # in_dim, out_dim
@@ -72,7 +79,7 @@ class KAN(nn.Module):
     out_dim: int
     inner_dims: Sequence[int]
 
-    n_grid: int = 5
+    n_coef: int = 5
     knot_dtype: jnp.dtype = jnp.float32
     train_knots: bool = True
     layer_dropout_rate: float = 0.0
@@ -90,12 +97,12 @@ class KAN(nn.Module):
         out_dim = self.out_hidden_dim or self.out_dim
         out_dims = (*self.inner_dims, out_dim)
 
-        knot_init = np.linspace(-1, 1, self.n_grid, dtype=self.knot_dtype)
+        knot_init = np.linspace(-1, 1, self.n_coef, dtype=self.knot_dtype)
         knot_init = np.sign(knot_init) * np.sqrt(np.abs(knot_init))
         self.knots = knot_init
 
         for out_dim in out_dims:
-            layers.append(self.layer_templ.copy(in_dim=in_dim, out_dim=out_dim, knots=self.knots))
+            layers.append(self.layer_templ.copy(in_dim=in_dim, out_dim=out_dim, knots=self.knots, n_coef=self.n_coef))
             norms.append(self.normalization())
             dropouts.append(nn.Dropout(self.layer_dropout_rate))
             in_dim = out_dim
@@ -132,7 +139,10 @@ class KAN(nn.Module):
 if __name__ == '__main__':
     in_dim = 4
     rng = jr.key(0)
-    xtest = jr.normal(rng, (in_dim,))
+    xtest = jr.normal(
+        rng,
+        (14, in_dim),
+    )
 
     kan = KAN(in_dim=in_dim, out_dim=6, inner_dims=[5], hidden_dim=15, out_hidden_dim=12)
     flax_summary(kan, x=xtest, compute_flops=True, compute_vjp_flops=True)

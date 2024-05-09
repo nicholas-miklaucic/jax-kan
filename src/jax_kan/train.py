@@ -21,6 +21,7 @@ from jaxtyping import Array, Bool, Float
 from rich.progress import Progress, track
 from rich.progress_bar import ProgressBar
 
+import sherpa
 from jax_kan.kan import KANLayer
 from jax_kan.utils import Identity, debug_stat, debug_structure, flax_summary
 
@@ -33,37 +34,24 @@ loss_norm_fn = jnp.abs
 dataset_splits = (3, 4, 5, 6, 7)
 batch_size = 32
 valid_prop = 0.2
-start_frac = 0.4
-end_frac = 0.01
-base_lr = 5e-3
-weight_decay = 0.04
+start_frac = 0.8
+end_frac = 0.1
 nesterov = True
 warmup = 10
-n_epochs = 1000
+n_epochs = 2000
 dtype = jnp.float32
 
 
-n_grid = 12
-node_dropout = 0.2
+n_coef = 4
+node_dropout = 0
 order = 3
-spline_input_map = lambda x: jnp.tanh(x)
-
-kwargs = {
-    'n_grid': n_grid,
-    'inner_dims': [128, 96],
-    'normalization': ft.partial(nn.LayerNorm),
-    'hidden_dim': 128,
-    'out_hidden_dim': 1,
-    'train_knots': False,
-    'layer_templ': KANLayer(
-        1,
-        1,
-        order=order,
-        dropout_rate=node_dropout,
-        base_act=lambda x: x,
-        spline_input_map=spline_input_map,
-    ),
-}
+spline_input_map = lambda x: nn.tanh(x)
+hidden_dim = None
+inner_dims = [224, 128, 96]
+normalization = Identity
+base_act = nn.tanh
+weight_decay = 0
+base_lr = 5e-3
 
 
 # -------------------------------
@@ -167,7 +155,7 @@ class TrainState(train_state.TrainState):
     pass
 
 
-def create_train_state(model: nn.Module, rng):
+def create_train_state(model: nn.Module, rng, sched=sched, weight_decay=weight_decay, nesterov=nesterov):
     model_state = model.init(rng, sample_batch.X, training=False)
     params = model_state.pop('params')
     tx = optax.adamw(sched, weight_decay=weight_decay, nesterov=nesterov)
@@ -213,15 +201,26 @@ def step(state, grad, updates):
     return state
 
 
-def train_model(model: nn.Module):
+def train_model(
+    model: nn.Module,
+    sched=sched,
+    weight_decay=weight_decay,
+    nesterov=nesterov,
+    show_progress=True,
+    show_sub_progress=False,
+    sherpa=None,
+):
     start_t = time.time()
     param_state, dropout_state = jr.split(jr.key(np.random.randint(0, 1000)), 2)
-    state = create_train_state(model, param_state)
-    console.print(model.__class__.__name__)
+    state = create_train_state(model, param_state, sched=sched, weight_decay=weight_decay, nesterov=nesterov)
+    # console.print(model.__class__.__name__)
     epoch_df = []
 
     train_dl = data_loader()
     valid_dl = data_loader(split='valid')
+
+    if sherpa is not None:
+        study, trial = sherpa
 
     with Progress(
         rprog.TextColumn('[progress.description]{task.description}'),
@@ -233,11 +232,12 @@ def train_model(model: nn.Module):
         refresh_per_second=3,
         console=console,
         expand=True,
+        disable=not show_progress,
     ) as prog:
         epochs = prog.add_task('Training', total=n_epochs)
 
         for epoch_i in range(n_epochs):
-            epoch_bar = prog.add_task(f'Train {epoch_i}...', total=steps_in_epoch)
+            epoch_bar = prog.add_task(f'Train {epoch_i}...', total=steps_in_epoch, visible=show_sub_progress)
             losses = []
             for _, batch in zip(range(steps_in_epoch), train_dl):
                 grad, loss, updates = apply_model(state, batch, training=True, dropout_key=dropout_state)
@@ -246,9 +246,9 @@ def train_model(model: nn.Module):
                 state = step(state, grad, updates)
                 prog.update(epoch_bar, advance=1)
 
-            train_loss = np.mean(losses)
+            train_loss = float(np.mean(losses))
 
-            valid_bar = prog.add_task(f'Valid {epoch_i}...', total=steps_in_valid_epoch)
+            valid_bar = prog.add_task(f'Valid {epoch_i}...', total=steps_in_valid_epoch, visible=show_sub_progress)
             losses = []
             for _, batch in zip(range(steps_in_valid_epoch), valid_dl):
                 grad, loss, updates = apply_model(state, batch, training=False, dropout_key=dropout_state)
@@ -258,10 +258,17 @@ def train_model(model: nn.Module):
             prog.update(epoch_bar, visible=False, completed=True)
             prog.update(valid_bar, visible=False, completed=True)
 
-            valid_loss = np.mean(losses)
+            valid_loss = float(np.mean(losses))
             epoch_df.append({'train': train_loss, 'valid': valid_loss})
 
             prog.update(epochs, advance=1, description=f'Train: {train_loss:.03f}\tValid: {valid_loss:.03f}')
+
+            if sherpa is not None:
+                study.add_observation(
+                    trial=trial, iteration=epoch_i, objective=valid_loss, context={'train_loss': train_loss}
+                )
+                if study.should_trial_stop(trial):
+                    return state, pd.DataFrame(epoch_df), time.time() - start_t
 
     end_t = time.time()
 
@@ -275,17 +282,157 @@ if __name__ == '__main__':
 
     from jax_kan.kan import KAN
 
+    # act_choices = ['silu', 'tanh', 'identity']
+
+    # def get_act(act: str) -> Callable:
+    #     if act == 'identity':
+    #         return Identity()
+    #     else:
+    #         return getattr(nn, act)
+
+    # def get_norm(norm: str) -> Callable:
+    #     if norm == 'identity':
+    #         return Identity
+    #     else:
+    #         return getattr(nn, norm)
+
+    # params = [
+    #     sherpa.Choice(name='base_act', range=['tanh']),
+    #     sherpa.Continuous(name='spline_input_scale', range=[1 / 8, 2], scale='log'),
+    #     sherpa.Ordinal(name='n_coef', range=[3, 5, 7, 9]),
+    #     sherpa.Choice(name='normalization', range=['identity', 'LayerNorm']),
+    #     sherpa.Continuous(name='node_dropout', range=[0, 0.01]),
+    #     sherpa.Continuous(name='weight_decay', range=[1e-5, 0.02], scale='log'),
+    #     sherpa.Continuous(name='base_lr', range=[1e-4, 1e-2], scale='log'),
+    #     # sherpa.Discrete(name='hidden_dim', range=[32, 1024], scale='log'),
+    #     sherpa.Choice(name='nesterov', range=[True]),
+    # ]
+
+    # n_hidden_layers = 4
+    # for layer in range(n_hidden_layers):
+    #     params.append(sherpa.Discrete(name=f'inner_dims_{layer+1}', range=[32, 512], scale='log'))
+
+    # alg = sherpa.algorithms.GPyOpt(
+    #     initial_data_points=[
+    #         {
+    #             'base_act': 'tanh',
+    #             'spline_input_scale': 0.9,
+    #             'n_coef': 5,
+    #             'normalization': 'identity',
+    #             'node_dropout': 0.01,
+    #             'weight_decay': 1e-3,
+    #             'base_lr': 5e-3,
+    #             'nesterov': True,
+    #             'inner_dims_1': 256,
+    #             'inner_dims_2': 128,
+    #             'inner_dims_3': 96,
+    #             'inner_dims_4': 96,
+    #         }
+    #     ],
+    #     max_num_trials=50,
+    # )
+
+    # alg = sherpa.algorithms.SuccessiveHalving(max_finished_configs=30)
+
+    # study = sherpa.Study(
+    #     params,
+    #     alg,
+    #     lower_is_better=True,
+    #     stopping_rule=sherpa.algorithms.MedianStoppingRule(min_iterations=100, min_trials=5),
+    # )
+
+    # for trial in study:
+    #     n_coef = trial.parameters['n_coef']
+    #     node_dropout = trial.parameters['node_dropout']
+    #     spline_input_map = lambda x, trial=trial: jnp.tanh(x * trial.parameters['spline_input_scale'])
+    #     inner_dims = [trial.parameters[f'inner_dims_{i+1}'] for i in range(n_hidden_layers)]
+    #     normalization = get_norm(trial.parameters['normalization'])
+    #     # hidden_dim = trial.parameters['hidden_dim']
+    #     base_act = get_act(trial.parameters['base_act'])
+    #     weight_decay = trial.parameters['weight_decay']
+    #     base_lr = trial.parameters['base_lr']
+
+    #     kwargs = {
+    #         'n_coef': n_coef,
+    #         'inner_dims': inner_dims,
+    #         'normalization': normalization,
+    #         'hidden_dim': hidden_dim,
+    #         'out_hidden_dim': 1,
+    #         'layer_templ': KANLayer(
+    #             1,
+    #             1,
+    #             order=order,
+    #             dropout_rate=node_dropout,
+    #             base_act=base_act,
+    #             spline_input_map=spline_input_map,
+    #         ),
+    #     }
+
+    #     sched = optax.warmup_cosine_decay_schedule(
+    #         init_value=start_frac * base_lr,
+    #         peak_value=base_lr,
+    #         warmup_steps=warmup_steps,
+    #         decay_steps=steps_in_epoch * n_epochs,
+    #         end_value=end_frac * base_lr,
+    #     )
+
+    #     kan = KAN(in_dim=sample_batch.X.shape[-1], out_dim=1, final_act=target_transforms[target], **kwargs)
+    #     kan_state, kan_epochs, duration = train_model(
+    #         kan,
+    #         sched=sched,
+    #         weight_decay=trial.parameters['weight_decay'],
+    #         nesterov=trial.parameters['nesterov'],
+    #         sherpa=(study, trial),
+    #     )
+
+    #     study.save('sherpa')
+
+    #     study.finalize(trial)
+
+    # study.save('sherpa')
+
+    kwargs = {
+        'n_coef': n_coef,
+        'inner_dims': inner_dims,
+        'normalization': normalization,
+        'hidden_dim': hidden_dim,
+        'out_hidden_dim': 1,
+        'layer_templ': KANLayer(
+            1,
+            1,
+            order=order,
+            dropout_rate=node_dropout,
+            base_act=base_act,
+            spline_input_map=spline_input_map,
+        ),
+    }
+
+    sched = optax.warmup_cosine_decay_schedule(
+        init_value=start_frac * base_lr,
+        peak_value=base_lr,
+        warmup_steps=warmup_steps,
+        decay_steps=steps_in_epoch * n_epochs,
+        end_value=end_frac * base_lr,
+    )
+
     kan = KAN(in_dim=sample_batch.X.shape[-1], out_dim=1, final_act=target_transforms[target], **kwargs)
 
     sample_out, params = kan.init_with_output(jr.key(0), sample_batch.X)
 
-    # debug_stat(jnp.abs(sample_out.squeeze() - sample_batch.y))
-    # debug_structure(sample_out)
-    # debug_structure(params)
+    debug_stat(jnp.abs(sample_out.squeeze() - sample_batch.y))
+    debug_structure(sample_out)
+    debug_structure(params)
 
     flax_summary(kan, x=sample_batch.X, compute_flops=True, compute_vjp_flops=True)
 
-    kan_state, kan_epochs, duration = train_model(kan)
+    kan_state, kan_epochs, duration = train_model(
+        kan,
+        sched=sched,
+        weight_decay=weight_decay,
+        nesterov=nesterov,
+    )
+
+    debug_stat(jax.tree_map(jnp.abs, kan_state.params))
 
     table = Table(title='Run')
 

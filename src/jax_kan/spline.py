@@ -8,6 +8,8 @@ import numpy as np
 from flax import linen as nn
 from flax import struct
 from jaxtyping import Array, Float, Int
+from orthax import chebyshev as C
+from orthax import legendre as L
 
 from jax_kan.typing_utils import class_tcheck
 
@@ -83,3 +85,73 @@ class BSpline:
         """
 
         return jnp.dot(self.design_matrix(x), coefs)
+
+
+class Chebyshev(BSpline):
+    """Chebyshev polynomials of the first kind."""
+
+    def __init__(self, n_coefs: int):
+        self._n_coefs = n_coefs
+
+    @property
+    def n_coefs(self) -> int:
+        return self._n_coefs
+
+    def design_matrix(self, x: Float[Array, '']) -> Float[Array, 'coefs={self.n_coefs}']:
+        return C.chebval(x, jnp.ones(self.n_coefs))
+
+
+class Jacobi(Chebyshev):
+    """Jacobi polynomials, scaled so the value at 1 is 1."""
+
+    def __init__(self, alpha: Float[Array, ''], beta: Float[Array, ''], n_coefs: int):
+        super().__init__(n_coefs)
+        self.alpha = alpha
+        self.beta = beta
+
+        self.scaling = self.design_matrix(jnp.where(self.alpha < self.beta, -1, 1))
+
+    def design_matrix(self, x: Float[Array, '']) -> Float[Array, 'coefs={self.n_coefs}']:
+        a = self.alpha
+        b = self.beta
+
+        # x0 = jnp.ones_like(x, dtype=x.dtype)[None]
+        x0 = x
+        polys = [x0, (a + 1) * (a + b + 2) * (x0 - 1) / 2]
+
+        for n in range(2, self.n_coefs):
+            # https://www.wikiwand.com/en/Jacobi_polynomials#Recurrence_relations
+            a = n + self.alpha
+            b = n + self.beta
+            c = a + b
+
+            den = 2 * n * (c - n) * (c - 2)
+            coef1 = ((c - 1) * (c * (c - 2) * x + (a - b) * (c - 2 * n))) / den
+            coef2 = (-2 * (a - 1) * (b - 1) * c) / den
+
+            polys.append(coef1 * polys[-1] - coef2 * polys[-2])
+
+        return jnp.array(polys[: self.n_coefs])
+
+    def __call__(
+        self,
+        x: Float[Array, ''],
+        coefs: Float[Array, ' coefs={self.n_grid}+{self.order}-1'],
+    ) -> Float[Array, '']:
+        """
+        Evaluates the spline defined on grid with coefficients coef at x.
+
+        Parameters
+        ----------
+        x: Float[]
+            The value for which to compute the splines for.
+        coef: Float[coefs]
+            The coefficients of the splines.
+
+        Returns
+        -------
+        Float[]
+            The value of the spline curve at x.
+        """
+
+        return jnp.dot(self.design_matrix(x) / self.scaling, coefs)
