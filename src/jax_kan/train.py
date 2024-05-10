@@ -3,6 +3,7 @@ import time
 from collections.abc import Mapping, Sequence
 from random import shuffle
 from typing import Any, Callable
+import optuna
 
 import flax.linen as nn
 import jax
@@ -21,7 +22,6 @@ from jaxtyping import Array, Bool, Float
 from rich.progress import Progress, track
 from rich.progress_bar import ProgressBar
 
-import sherpa
 from jax_kan.kan import KANLayer
 from jax_kan.utils import Identity, debug_stat, debug_structure, flax_summary
 
@@ -33,25 +33,26 @@ target = 'yield_featurized'
 loss_norm_fn = jnp.abs
 dataset_splits = (3, 4, 5, 6, 7)
 batch_size = 32
-valid_prop = 0.2
+n_folds = 8
 start_frac = 0.8
 end_frac = 0.1
 nesterov = True
 warmup = 10
-n_epochs = 2000
+n_epochs = 400
 dtype = jnp.float32
 
 
-n_coef = 4
+n_coef = 5
 node_dropout = 0
 order = 3
-spline_input_map = lambda x: nn.tanh(x)
+spline_input_map = lambda x: nn.tanh(x * 0.8)
 hidden_dim = None
-inner_dims = [224, 128, 96]
+inner_dims = [196, 84, 64]
 normalization = Identity
 base_act = nn.tanh
 weight_decay = 0
-base_lr = 5e-3
+base_lr = 4e-3
+gamma = 0.99
 
 
 # -------------------------------
@@ -76,9 +77,7 @@ else:
     msg = f'Unknown target: {target}'
     raise ValueError(msg)
 
-valid_size = int(round(df.shape[0] * valid_prop / batch_size)) * batch_size
-valid_inds = np.random.default_rng(seed=123).choice(df.index, valid_size, replace=False)
-is_valid = df.index.isin(valid_inds)
+valid_inds = np.random.default_rng(seed=2718).integers(low=0, high=n_folds, size=df.shape[0])
 
 
 if target == 'bandgap':
@@ -87,17 +86,16 @@ if target == 'bandgap':
 
 
 datasets = []
-for sub in df[is_valid], df[~is_valid]:
+for fold in range(n_folds):
+    sub = df[valid_inds == fold]
     Xy = jnp.array(sub.values, dtype=dtype)
     num_pad = -Xy.shape[0] % batch_size
     mask = jnp.concat([jnp.ones(Xy.shape[0]), jnp.zeros(num_pad)]).astype(jnp.bool)
     Xy = jnp.concat([Xy, Xy[:num_pad]])
     datasets.append((Xy, mask))
 
-datasets = {'train': datasets[1], 'valid': datasets[0]}
-
-steps_in_epoch = datasets['train'][0].shape[0] // batch_size
-steps_in_valid_epoch = datasets['valid'][0].shape[0] // batch_size
+steps_in_valid_epoch = datasets[0][0].shape[0] // batch_size
+steps_in_epoch = steps_in_valid_epoch * (n_folds - 1)
 
 
 @struct.dataclass
@@ -110,11 +108,21 @@ class TrainBatch:
         return {'X': self.X, 'y': self.y, 'mask': self.mask}
 
 
-def data_loader(split='train', infinite=True):
-    data, mas = datasets[split]
+def data_loader(split='train', fold=0, infinite=True):
+    if split == 'valid':
+        data, mas = datasets[fold]
 
-    data = jnp.array(data)
-    mas = jnp.array(mas)
+        data = jnp.array(data)
+        mas = jnp.array(mas)
+    else:
+        datas = []
+        mass = []
+        for i, (data, mas) in enumerate(datasets):
+            if i != fold:
+                datas.append(jnp.array(data))
+                mass.append(jnp.array(mas))
+        data = jnp.concatenate(datas)
+        mas = jnp.concatenate(mass)
 
     n_splits = data.shape[0] // batch_size
     data_batches = jnp.split(data, n_splits)
@@ -133,9 +141,6 @@ def data_loader(split='train', infinite=True):
 
 sample_batch = next(data_loader())
 # debug_structure(sample_batch)
-
-
-train_dl = data_loader('valid')
 
 # for _i in traclk(list(range(1000))):
 #     sample_batch = next(train_dl)
@@ -208,7 +213,8 @@ def train_model(
     nesterov=nesterov,
     show_progress=True,
     show_sub_progress=False,
-    sherpa=None,
+    fold=0,
+    gamma=0.99
 ):
     start_t = time.time()
     param_state, dropout_state = jr.split(jr.key(np.random.randint(0, 1000)), 2)
@@ -216,11 +222,10 @@ def train_model(
     # console.print(model.__class__.__name__)
     epoch_df = []
 
-    train_dl = data_loader()
-    valid_dl = data_loader(split='valid')
+    ema_params = state.params
 
-    if sherpa is not None:
-        study, trial = sherpa
+    train_dl = data_loader(split='train', fold=fold)
+    valid_dl = data_loader(split='valid', fold=fold)
 
     with Progress(
         rprog.TextColumn('[progress.description]{task.description}'),
@@ -244,6 +249,7 @@ def train_model(
                 # debug_stat(grad)
                 losses.append(loss)
                 state = step(state, grad, updates)
+                ema_params = jax.tree_map(lambda x, y: gamma * x + (1 - gamma) * y, ema_params, state.params)
                 prog.update(epoch_bar, advance=1)
 
             train_loss = float(np.mean(losses))
@@ -261,20 +267,13 @@ def train_model(
             valid_loss = float(np.mean(losses))
             epoch_df.append({'train': train_loss, 'valid': valid_loss})
 
-            prog.update(epochs, advance=1, description=f'Train: {train_loss:.03f}\tValid: {valid_loss:.03f}')
-
-            if sherpa is not None:
-                study.add_observation(
-                    trial=trial, iteration=epoch_i, objective=valid_loss, context={'train_loss': train_loss}
-                )
-                if study.should_trial_stop(trial):
-                    return state, pd.DataFrame(epoch_df), time.time() - start_t
+            prog.update(epochs, advance=1, description=f'Train: {train_loss:>8.03f}\tValid: {valid_loss:>8.03f}')
 
     end_t = time.time()
 
     duration = end_t - start_t
 
-    return state, pd.DataFrame(epoch_df), duration
+    return state.replace(params=ema_params), pd.DataFrame(epoch_df), duration
 
 
 if __name__ == '__main__':
@@ -282,114 +281,92 @@ if __name__ == '__main__':
 
     from jax_kan.kan import KAN
 
-    # act_choices = ['silu', 'tanh', 'identity']
+    import optuna
 
-    # def get_act(act: str) -> Callable:
-    #     if act == 'identity':
-    #         return Identity()
-    #     else:
-    #         return getattr(nn, act)
 
-    # def get_norm(norm: str) -> Callable:
-    #     if norm == 'identity':
-    #         return Identity
-    #     else:
-    #         return getattr(nn, norm)
+    def objective(trial: optuna.Trial):
+        n_coef = trial.suggest_int('n_coef', 5, 5)
+        spline_input_scale = trial.suggest_float('spline_input_scale', 0.75, 0.85)
+        gamma = 1 - trial.suggest_float('gamma', 1e-3, 1e-2)
+        base_lr = trial.suggest_float('base_lr', 5e-4, 3e-3)
 
-    # params = [
-    #     sherpa.Choice(name='base_act', range=['tanh']),
-    #     sherpa.Continuous(name='spline_input_scale', range=[1 / 8, 2], scale='log'),
-    #     sherpa.Ordinal(name='n_coef', range=[3, 5, 7, 9]),
-    #     sherpa.Choice(name='normalization', range=['identity', 'LayerNorm']),
-    #     sherpa.Continuous(name='node_dropout', range=[0, 0.01]),
-    #     sherpa.Continuous(name='weight_decay', range=[1e-5, 0.02], scale='log'),
-    #     sherpa.Continuous(name='base_lr', range=[1e-4, 1e-2], scale='log'),
-    #     # sherpa.Discrete(name='hidden_dim', range=[32, 1024], scale='log'),
-    #     sherpa.Choice(name='nesterov', range=[True]),
-    # ]
+        num_layers = trial.suggest_int('num_layers', 3, 3)
 
-    # n_hidden_layers = 4
-    # for layer in range(n_hidden_layers):
-    #     params.append(sherpa.Discrete(name=f'inner_dims_{layer+1}', range=[32, 512], scale='log'))
+        dims = []
+        for i in range(num_layers):
+            if i == 0:
+                dims.append(trial.suggest_int(f'inner_dims_{i+1}', 256, 512, log=True))
+            else:
+                mult = trial.suggest_float(f'inner_dim_scale_{i+1}', 0.25, 0.6)
+                dims.append(int(round(mult * dims[-1])))
 
-    # alg = sherpa.algorithms.GPyOpt(
-    #     initial_data_points=[
-    #         {
-    #             'base_act': 'tanh',
-    #             'spline_input_scale': 0.9,
-    #             'n_coef': 5,
-    #             'normalization': 'identity',
-    #             'node_dropout': 0.01,
-    #             'weight_decay': 1e-3,
-    #             'base_lr': 5e-3,
-    #             'nesterov': True,
-    #             'inner_dims_1': 256,
-    #             'inner_dims_2': 128,
-    #             'inner_dims_3': 96,
-    #             'inner_dims_4': 96,
-    #         }
-    #     ],
-    #     max_num_trials=50,
-    # )
+        spline_input_map = lambda x, scale=spline_input_scale: jnp.tanh(x * scale)
 
-    # alg = sherpa.algorithms.SuccessiveHalving(max_finished_configs=30)
+        kwargs = {
+            'n_coef': n_coef,
+            'inner_dims': dims,
+            'normalization': normalization,
+            'hidden_dim': hidden_dim,
+            'out_hidden_dim': 1,
+            'layer_templ': KANLayer(
+                1,
+                1,
+                order=order,
+                dropout_rate=node_dropout,
+                base_act=base_act,
+                spline_input_map=spline_input_map,
+            ),
+        }
 
-    # study = sherpa.Study(
-    #     params,
-    #     alg,
-    #     lower_is_better=True,
-    #     stopping_rule=sherpa.algorithms.MedianStoppingRule(min_iterations=100, min_trials=5),
-    # )
+        sched = optax.warmup_cosine_decay_schedule(
+            init_value=start_frac * base_lr,
+            peak_value=base_lr,
+            warmup_steps=warmup_steps,
+            decay_steps=steps_in_epoch * n_epochs,
+            end_value=end_frac * base_lr,
+        )
 
-    # for trial in study:
-    #     n_coef = trial.parameters['n_coef']
-    #     node_dropout = trial.parameters['node_dropout']
-    #     spline_input_map = lambda x, trial=trial: jnp.tanh(x * trial.parameters['spline_input_scale'])
-    #     inner_dims = [trial.parameters[f'inner_dims_{i+1}'] for i in range(n_hidden_layers)]
-    #     normalization = get_norm(trial.parameters['normalization'])
-    #     # hidden_dim = trial.parameters['hidden_dim']
-    #     base_act = get_act(trial.parameters['base_act'])
-    #     weight_decay = trial.parameters['weight_decay']
-    #     base_lr = trial.parameters['base_lr']
 
-    #     kwargs = {
-    #         'n_coef': n_coef,
-    #         'inner_dims': inner_dims,
-    #         'normalization': normalization,
-    #         'hidden_dim': hidden_dim,
-    #         'out_hidden_dim': 1,
-    #         'layer_templ': KANLayer(
-    #             1,
-    #             1,
-    #             order=order,
-    #             dropout_rate=node_dropout,
-    #             base_act=base_act,
-    #             spline_input_map=spline_input_map,
-    #         ),
-    #     }
+        table_df = []
 
-    #     sched = optax.warmup_cosine_decay_schedule(
-    #         init_value=start_frac * base_lr,
-    #         peak_value=base_lr,
-    #         warmup_steps=warmup_steps,
-    #         decay_steps=steps_in_epoch * n_epochs,
-    #         end_value=end_frac * base_lr,
-    #     )
+        kan = KAN(in_dim=sample_batch.X.shape[-1], out_dim=1, final_act=target_transforms[target], **kwargs)
 
-    #     kan = KAN(in_dim=sample_batch.X.shape[-1], out_dim=1, final_act=target_transforms[target], **kwargs)
-    #     kan_state, kan_epochs, duration = train_model(
-    #         kan,
-    #         sched=sched,
-    #         weight_decay=trial.parameters['weight_decay'],
-    #         nesterov=trial.parameters['nesterov'],
-    #         sherpa=(study, trial),
-    #     )
+        for fold in range(n_folds):
+            ema_state, kan_epochs, duration = train_model(
+                kan,
+                sched=sched,
+                weight_decay=weight_decay,
+                nesterov=nesterov,
+                fold=fold,
+                gamma=gamma
+            )
 
-    #     study.save('sherpa')
+            losses = []
+            for batch in data_loader(fold=fold, split='valid', infinite=False):
+                grad, loss, updates = apply_model(ema_state, batch, training=False, dropout_key=jr.key(0))
+                losses.append(loss)
 
-    #     study.finalize(trial)
+            best_valid = np.mean(losses).item()
+            console.print(f'EMA: {best_valid:.3f}')
 
-    # study.save('sherpa')
+            best_train = kan_epochs["train"].min()
+            # best_valid = kan_epochs["valid"].min()
+
+            table_df.append({'Duration': duration, 'Training': best_train, 'Validation': best_valid, 'Fold': fold})
+
+
+            trial.report(best_valid, fold)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        return pd.DataFrame(table_df).mean()['Validation']
+
+    # from rich.logging import RichHandler
+
+
+    # optuna.logging.get_logger("optuna").addHandler(RichHandler(console=console))
+    # study = optuna.create_study(pruner=optuna.pruners.MedianPruner())
+    # study.optimize(objective, n_trials=20)
 
     kwargs = {
         'n_coef': n_coef,
@@ -425,20 +402,41 @@ if __name__ == '__main__':
 
     flax_summary(kan, x=sample_batch.X, compute_flops=True, compute_vjp_flops=True)
 
-    kan_state, kan_epochs, duration = train_model(
-        kan,
-        sched=sched,
-        weight_decay=weight_decay,
-        nesterov=nesterov,
-    )
-
-    debug_stat(jax.tree_map(jnp.abs, kan_state.params))
-
+    table_df = []
     table = Table(title='Run')
 
     table.add_column('Duration', justify='right', style='cyan')
     table.add_column('Best Training', justify='right', style='magenta')
     table.add_column('Best Validation', justify='right', style='green')
 
-    table.add_row(f'{duration:.3f}s', f'{kan_epochs["train"].min():.3f}', f'{kan_epochs["valid"].min():.3f}')
+
+    for fold in range(n_folds):
+        kan = KAN(in_dim=sample_batch.X.shape[-1], out_dim=1, final_act=target_transforms[target], **kwargs)
+        ema_state, kan_epochs, duration = train_model(
+            kan,
+            sched=sched,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+            fold=fold
+        )
+
+        # ema_params = jax.tree_map(lambda *xs: jnp.mean(ema_gamma * xs, axis=0), *[state.params for state in kan_states])
+
+        losses = []
+        for batch in data_loader(fold=fold, split='valid', infinite=False):
+            grad, loss, updates = apply_model(ema_state, batch, training=False, dropout_key=jr.key(0))
+            losses.append(loss)
+
+        best_valid = np.mean(losses).item()
+        console.print(f'EMA: {best_valid:.3f}')
+
+        best_train = kan_epochs["train"].min()
+        # best_valid = kan_epochs["valid"].min()
+
+        table.add_row(f'{duration:.3f}s', f'{best_train.min():.3f}', f'{best_valid:.3f}')
+        table_df.append({'Duration': duration, 'Training': best_train.min(), 'Validation': best_valid, 'Fold': fold})
+
+
     console.print(table)
+
+    console.print(pd.DataFrame(table_df).mean())
