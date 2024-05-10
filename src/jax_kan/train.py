@@ -32,28 +32,27 @@ console = rich.console.Console()
 target = 'yield_featurized'
 loss_norm_fn = jnp.abs
 dataset_splits = (3, 4, 5, 6, 7)
-batch_size = 32
-n_folds = 8
+batch_size = 16
+n_folds = 5
 start_frac = 0.8
-end_frac = 0.1
+end_frac = 0.2
 nesterov = True
 warmup = 10
-n_epochs = 400
+n_epochs = 200
 dtype = jnp.float32
-
+optimize = False
 
 n_coef = 5
-node_dropout = 0
+node_dropout = 0.3
 order = 3
 spline_input_map = lambda x: nn.tanh(x * 0.8)
 hidden_dim = None
-inner_dims = [196, 84, 64]
+inner_dims = [512, 128, 64]
 normalization = Identity
 base_act = nn.tanh
 weight_decay = 0
-base_lr = 4e-3
-gamma = 0.99
-
+base_lr = 6e-3
+gamma = 0.997
 
 # -------------------------------
 
@@ -77,7 +76,9 @@ else:
     msg = f'Unknown target: {target}'
     raise ValueError(msg)
 
-valid_inds = np.random.default_rng(seed=2718).integers(low=0, high=n_folds, size=df.shape[0])
+
+fold_ids = np.arange(df.shape[0]) % 5
+valid_inds = np.random.default_rng(seed=43).permutation(fold_ids)
 
 
 if target == 'bandgap':
@@ -94,9 +95,13 @@ for fold in range(n_folds):
     Xy = jnp.concat([Xy, Xy[:num_pad]])
     datasets.append((Xy, mask))
 
+# print([sum(fold_ids == i) for i in range(n_folds)])
+
 steps_in_valid_epoch = datasets[0][0].shape[0] // batch_size
 steps_in_epoch = steps_in_valid_epoch * (n_folds - 1)
 
+# print(datasets[0][0].shape[0])
+# print(sum([datasets[i][0].shape[0] for i in range(1, n_folds)]))
 
 @struct.dataclass
 class TrainBatch:
@@ -147,21 +152,23 @@ sample_batch = next(data_loader())
 
 
 warmup_steps = steps_in_epoch * min(warmup, n_epochs // 4)
-sched = optax.warmup_cosine_decay_schedule(
-    init_value=start_frac * base_lr,
-    peak_value=base_lr,
-    warmup_steps=warmup_steps,
-    decay_steps=steps_in_epoch * n_epochs,
-    end_value=end_frac * base_lr,
-)
+# sched = optax.warmup_cosine_decay_schedule(
+#     init_value=start_frac * base_lr,
+#     peak_value=base_lr,
+#     warmup_steps=warmup_steps,
+#     decay_steps=steps_in_epoch * n_epochs,
+#     end_value=end_frac * base_lr,
+# )
 
 
 class TrainState(train_state.TrainState):
     pass
 
 
-def create_train_state(model: nn.Module, rng, sched=sched, weight_decay=weight_decay, nesterov=nesterov):
-    model_state = model.init(rng, sample_batch.X, training=False)
+def create_train_state(model: nn.Module, rng, sched, weight_decay=0, nesterov=True, sample_X=None):
+    if sample_X is None:
+        sample_X = sample_batch.X
+    model_state = model.init(rng, sample_X, training=False)
     params = model_state.pop('params')
     tx = optax.adamw(sched, weight_decay=weight_decay, nesterov=nesterov)
     return TrainState.create(apply_fn=model.apply, params=params, tx=tx, **model_state)
@@ -190,11 +197,11 @@ def apply_model(state: TrainState, batch: TrainBatch, training: bool, dropout_ke
             updates = {}
 
         err = loss_norm_fn(jnp.squeeze(yhat, -1) - batch.y) * batch.mask
-        return jnp.mean(err), updates
+        return jnp.sum(err) / jnp.sum(batch.mask), (updates, out)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, updates), grad = grad_fn(state.params)
-    return grad, loss, updates
+    (loss, (updates, out)), grad = grad_fn(state.params)
+    return grad, loss, updates, out
 
 
 @jax.jit
@@ -208,13 +215,15 @@ def step(state, grad, updates):
 
 def train_model(
     model: nn.Module,
-    sched=sched,
-    weight_decay=weight_decay,
-    nesterov=nesterov,
+    sched=None,
+    weight_decay=0,
+    nesterov=True,
     show_progress=True,
     show_sub_progress=False,
     fold=0,
-    gamma=0.99
+    gamma=0.99,
+    train_dl=None,
+    valid_dl=None,
 ):
     start_t = time.time()
     param_state, dropout_state = jr.split(jr.key(np.random.randint(0, 1000)), 2)
@@ -224,8 +233,10 @@ def train_model(
 
     ema_params = state.params
 
-    train_dl = data_loader(split='train', fold=fold)
-    valid_dl = data_loader(split='valid', fold=fold)
+    if train_dl is None:
+        train_dl = data_loader(split='train', fold=fold)
+    if valid_dl is None:
+        valid_dl = data_loader(split='valid', fold=fold)
 
     with Progress(
         rprog.TextColumn('[progress.description]{task.description}'),
@@ -245,7 +256,7 @@ def train_model(
             epoch_bar = prog.add_task(f'Train {epoch_i}...', total=steps_in_epoch, visible=show_sub_progress)
             losses = []
             for _, batch in zip(range(steps_in_epoch), train_dl):
-                grad, loss, updates = apply_model(state, batch, training=True, dropout_key=dropout_state)
+                grad, loss, updates, out = apply_model(state, batch, training=True, dropout_key=dropout_state)
                 # debug_stat(grad)
                 losses.append(loss)
                 state = step(state, grad, updates)
@@ -257,7 +268,7 @@ def train_model(
             valid_bar = prog.add_task(f'Valid {epoch_i}...', total=steps_in_valid_epoch, visible=show_sub_progress)
             losses = []
             for _, batch in zip(range(steps_in_valid_epoch), valid_dl):
-                grad, loss, updates = apply_model(state, batch, training=False, dropout_key=dropout_state)
+                grad, loss, updates, out = apply_model(state, batch, training=False, dropout_key=dropout_state)
                 losses.append(loss)
                 prog.update(valid_bar, advance=1)
 
@@ -285,12 +296,13 @@ if __name__ == '__main__':
 
 
     def objective(trial: optuna.Trial):
-        n_coef = trial.suggest_int('n_coef', 5, 5)
+        n_coef = trial.suggest_int('n_coef', 4, 7)
         spline_input_scale = trial.suggest_float('spline_input_scale', 0.75, 0.85)
-        gamma = 1 - trial.suggest_float('gamma', 1e-3, 1e-2)
-        base_lr = trial.suggest_float('base_lr', 5e-4, 3e-3)
-
-        num_layers = trial.suggest_int('num_layers', 3, 3)
+        # gamma = 1 - trial.suggest_float('gamma', 1e-3, 1e-2)
+        gamma = 0.997
+        base_lr = trial.suggest_float('base_lr', 2e-3, 6e-3)
+        final_scale = trial.suggest_float('final_scale', 1, 5)
+        num_layers = trial.suggest_int('num_layers', 2, 4)
 
         dims = []
         for i in range(num_layers):
@@ -301,6 +313,7 @@ if __name__ == '__main__':
                 dims.append(int(round(mult * dims[-1])))
 
         spline_input_map = lambda x, scale=spline_input_scale: jnp.tanh(x * scale)
+        
 
         kwargs = {
             'n_coef': n_coef,
@@ -329,7 +342,7 @@ if __name__ == '__main__':
 
         table_df = []
 
-        kan = KAN(in_dim=sample_batch.X.shape[-1], out_dim=1, final_act=target_transforms[target], **kwargs)
+        kan = KAN(in_dim=sample_batch.X.shape[-1], out_dim=1, final_act=lambda x, s=final_scale: target_transforms[target](x * s), **kwargs)
 
         for fold in range(n_folds):
             ema_state, kan_epochs, duration = train_model(
@@ -343,11 +356,19 @@ if __name__ == '__main__':
 
             losses = []
             for batch in data_loader(fold=fold, split='valid', infinite=False):
-                grad, loss, updates = apply_model(ema_state, batch, training=False, dropout_key=jr.key(0))
+                grad, loss, updates, out = apply_model(ema_state, batch, training=False, dropout_key=jr.key(0))
                 losses.append(loss)
 
             best_valid = np.mean(losses).item()
             console.print(f'EMA: {best_valid:.3f}')
+
+            losses = []
+            for batch in data_loader(fold=fold, split='train', infinite=False):
+                grad, loss, updates, out = apply_model(ema_state, batch, training=False, dropout_key=jr.key(0))
+                losses.append(loss)
+
+            best_train = np.mean(losses).item()
+            console.print(f'EMA (Training): {best_train:.3f}')
 
             best_train = kan_epochs["train"].min()
             # best_valid = kan_epochs["valid"].min()
@@ -361,82 +382,97 @@ if __name__ == '__main__':
 
         return pd.DataFrame(table_df).mean()['Validation']
 
-    # from rich.logging import RichHandler
+    from rich.logging import RichHandler
 
 
-    # optuna.logging.get_logger("optuna").addHandler(RichHandler(console=console))
-    # study = optuna.create_study(pruner=optuna.pruners.MedianPruner())
-    # study.optimize(objective, n_trials=20)
+    
+    if optimize:
+        optuna.logging.get_logger("optuna").addHandler(RichHandler(console=console))
+        study = optuna.create_study(pruner=optuna.pruners.MedianPruner())
+        study.optimize(objective, n_trials=50)
+    else:
+        kwargs = {
+            'n_coef': n_coef,
+            'inner_dims': inner_dims,
+            'normalization': normalization,
+            'hidden_dim': hidden_dim,
+            'out_hidden_dim': 1,
+            'layer_templ': KANLayer(
+                1,
+                1,
+                order=order,
+                dropout_rate=node_dropout,
+                base_act=base_act,
+                spline_input_map=spline_input_map,
+            ),
+        }
 
-    kwargs = {
-        'n_coef': n_coef,
-        'inner_dims': inner_dims,
-        'normalization': normalization,
-        'hidden_dim': hidden_dim,
-        'out_hidden_dim': 1,
-        'layer_templ': KANLayer(
-            1,
-            1,
-            order=order,
-            dropout_rate=node_dropout,
-            base_act=base_act,
-            spline_input_map=spline_input_map,
-        ),
-    }
-
-    sched = optax.warmup_cosine_decay_schedule(
-        init_value=start_frac * base_lr,
-        peak_value=base_lr,
-        warmup_steps=warmup_steps,
-        decay_steps=steps_in_epoch * n_epochs,
-        end_value=end_frac * base_lr,
-    )
-
-    kan = KAN(in_dim=sample_batch.X.shape[-1], out_dim=1, final_act=target_transforms[target], **kwargs)
-
-    sample_out, params = kan.init_with_output(jr.key(0), sample_batch.X)
-
-    debug_stat(jnp.abs(sample_out.squeeze() - sample_batch.y))
-    debug_structure(sample_out)
-    debug_structure(params)
-
-    flax_summary(kan, x=sample_batch.X, compute_flops=True, compute_vjp_flops=True)
-
-    table_df = []
-    table = Table(title='Run')
-
-    table.add_column('Duration', justify='right', style='cyan')
-    table.add_column('Best Training', justify='right', style='magenta')
-    table.add_column('Best Validation', justify='right', style='green')
-
-
-    for fold in range(n_folds):
-        kan = KAN(in_dim=sample_batch.X.shape[-1], out_dim=1, final_act=target_transforms[target], **kwargs)
-        ema_state, kan_epochs, duration = train_model(
-            kan,
-            sched=sched,
-            weight_decay=weight_decay,
-            nesterov=nesterov,
-            fold=fold
+        sched = optax.warmup_cosine_decay_schedule(
+            init_value=start_frac * base_lr,
+            peak_value=base_lr,
+            warmup_steps=warmup_steps,
+            decay_steps=steps_in_epoch * n_epochs,
+            end_value=end_frac * base_lr,
         )
 
-        # ema_params = jax.tree_map(lambda *xs: jnp.mean(ema_gamma * xs, axis=0), *[state.params for state in kan_states])
+        kan = KAN(in_dim=sample_batch.X.shape[-1], out_dim=1, final_act=target_transforms[target], **kwargs)
 
-        losses = []
-        for batch in data_loader(fold=fold, split='valid', infinite=False):
-            grad, loss, updates = apply_model(ema_state, batch, training=False, dropout_key=jr.key(0))
-            losses.append(loss)
+        sample_out, params = kan.init_with_output(jr.key(0), sample_batch.X)
 
-        best_valid = np.mean(losses).item()
-        console.print(f'EMA: {best_valid:.3f}')
+        print(steps_in_epoch)        
 
-        best_train = kan_epochs["train"].min()
-        # best_valid = kan_epochs["valid"].min()
+        # debug_stat(jnp.abs(sample_out.squeeze() - sample_batch.y))
+        # debug_structure(sample_out)
+        # debug_structure(params)
 
-        table.add_row(f'{duration:.3f}s', f'{best_train.min():.3f}', f'{best_valid:.3f}')
-        table_df.append({'Duration': duration, 'Training': best_train.min(), 'Validation': best_valid, 'Fold': fold})
+        flax_summary(kan, x=sample_batch.X, compute_flops=True, compute_vjp_flops=True)        
+
+        table_df = []
+        table = Table(title='Run')
+
+        table.add_column('Duration', justify='right', style='cyan')
+        table.add_column('Best Training', justify='right', style='magenta')
+        table.add_column('Best Validation', justify='right', style='green')
 
 
-    console.print(table)
+        for fold in range(n_folds):
+            kan = KAN(in_dim=sample_batch.X.shape[-1], out_dim=1, final_act=target_transforms[target], **kwargs)
+            ema_state, kan_epochs, duration = train_model(
+                kan,
+                sched=sched,
+                weight_decay=weight_decay,
+                nesterov=nesterov,
+                fold=fold,
+                gamma=gamma
+            )
 
-    console.print(pd.DataFrame(table_df).mean())
+            # ema_params = jax.tree_map(lambda *xs: jnp.mean(ema_gamma * xs, axis=0), *[state.params for state in kan_states])
+
+            losses = []
+            for batch in data_loader(fold=fold, split='valid', infinite=False):
+                grad, loss, updates, out = apply_model(ema_state, batch, training=False, dropout_key=jr.key(0))
+                losses.append(loss)
+
+            best_valid = np.mean(losses).item()
+            console.print(f'EMA: {best_valid:.3f}')
+
+            losses = []
+            for batch in data_loader(fold=fold, split='train', infinite=False):
+                grad, loss, updates, out = apply_model(ema_state, batch, training=False, dropout_key=jr.key(0))
+                losses.append(loss)
+
+            best_train = np.mean(losses).item()
+            console.print(f'EMA (Training): {best_train:.3f}')
+
+            # debug_stat(ema_state.params)
+
+            # best_train = kan_epochs["train"].min()
+            # best_valid = kan_epochs["valid"].min()
+
+            table.add_row(f'{duration:.3f}s', f'{best_train:.3f}', f'{best_valid:.3f}')
+            table_df.append({'Duration': duration, 'Training': best_train, 'Validation': best_valid, 'Fold': fold})
+
+
+        console.print(table)
+
+        console.print(pd.DataFrame(table_df).mean())

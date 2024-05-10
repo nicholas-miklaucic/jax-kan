@@ -109,9 +109,10 @@ class Jacobi(Chebyshev):
         self.alpha = alpha
         self.beta = beta
 
-        self.scaling = self.design_matrix(jnp.where(self.alpha < self.beta, -1, 1))
+        # self.scaling = jnp.abs(jnp.max(jax.vmap(self._design_matrix)(jnp.linspace(-1, 1, 8))))        
+        self.scaling = 1
 
-    def design_matrix(self, x: Float[Array, '']) -> Float[Array, 'coefs={self.n_coefs}']:
+    def _design_matrix(self, x: Float[Array, '']) -> Float[Array, 'coefs={self.n_coefs}']:
         a = self.alpha
         b = self.beta
 
@@ -132,26 +133,6 @@ class Jacobi(Chebyshev):
             polys.append(coef1 * polys[-1] - coef2 * polys[-2])
 
         return jnp.array(polys[: self.n_coefs])
-
-    def __call__(
-        self,
-        x: Float[Array, ''],
-        coefs: Float[Array, ' coefs={self.n_grid}+{self.order}-1'],
-    ) -> Float[Array, '']:
-        """
-        Evaluates the spline defined on grid with coefficients coef at x.
-
-        Parameters
-        ----------
-        x: Float[]
-            The value for which to compute the splines for.
-        coef: Float[coefs]
-            The coefficients of the splines.
-
-        Returns
-        -------
-        Float[]
-            The value of the spline curve at x.
-        """
-
-        return jnp.dot(self.design_matrix(x) / self.scaling, coefs)
+    
+    def design_matrix(self, x: Float[Array, '']) -> Float[Array, 'coefs={self.n_coefs}']:
+        return self._design_matrix(x) / self.scaling

@@ -5,16 +5,18 @@
 
 -----
 
-**Table of Contents**
-
-- [Installation](#installation)
-- [License](#license)
-
 ## Installation
 
 ```console
 pip install jax-kan
 ```
+
+## Roadmap
+- [ ] Grid extension
+- [ ] Keras-like high-level framework
+- [ ] Mess with LayerNorm scale/shift to better match tanh bounds
+- [ ] Train both alpha and beta?
+
 
 ## License
 
