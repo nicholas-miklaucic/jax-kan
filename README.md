@@ -16,6 +16,8 @@ pip install jax-kan
 - [ ] Keras-like high-level framework
 - [ ] Mess with LayerNorm scale/shift to better match tanh bounds
 - [ ] Train both alpha and beta?
+- [ ] Curvature regularization
+- [ ] Early stopping w/o validation
 
 
 ## License

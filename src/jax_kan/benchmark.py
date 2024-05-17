@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 from typing import Any, Callable, Optional
-
+import pickle
 import numpy as np
 from jax_kan.kan import KAN, KANLayer
 import optax
@@ -26,7 +26,7 @@ feats = MultipleFeaturizer([
     cf.ElementProperty(preset.data_source, preset.features, stats=['mean', 'avg_dev', 'minimum', 'maximum']),
     cf.ElementProperty(megnet.data_source, megnet.features, stats=['mean', 'avg_dev', 'minimum', 'maximum']),
     cf.Miedema(),
-    cf.WenAlloys()   
+    cf.WenAlloys()
 ])
 
 columns = df.columns[:-1]
@@ -48,22 +48,22 @@ def mb_data_loader(X_data, y_data, batch_size, infinite=True, shuffle=True, emul
         masks = []
         fold_i = jnp.arange(Xy.shape[0]) % 4
         for fold in range(4):
-            sub = Xy[fold_i == fold]            
+            sub = Xy[fold_i == fold]
             num_pad = -sub.shape[0] % batch_size
             mask = jnp.concat([jnp.ones(sub.shape[0]), jnp.zeros(num_pad)]).astype(jnp.bool)
             sub = jnp.concat([sub, sub[:num_pad]])
             datasets.append(sub)
             masks.append(mask)
-        
+
         Xy = jnp.concat(datasets)
         mask = jnp.concat(masks)
-    else:        
+    else:
         num_pad = -Xy.shape[0] % batch_size
         mask = jnp.concat([jnp.ones(Xy.shape[0]), jnp.zeros(num_pad)]).astype(jnp.bool)
         Xy = jnp.concat([Xy, Xy[:num_pad]])
-    
-    data = Xy    
-    mas = mask     
+
+    data = Xy
+    mas = mask
 
     n_splits = data.shape[0] // batch_size
 
@@ -89,12 +89,12 @@ class KANModel:
     y: Sequence[float]
     n_coef: int = n_coef
     node_dropout: float = node_dropout
-    spline_input_map: Callable = spline_input_map    
+    spline_input_map: Callable = spline_input_map
     hidden_dim: Optional[int] = hidden_dim
     inner_dims: Sequence[int] = tuple(inner_dims)
-    normalization: Any = normalization    
+    normalization: Any = normalization
     weight_decay: float = weight_decay
-    base_lr: float = base_lr    
+    base_lr: float = base_lr
     gamma: float = gamma
     batch_size: int = batch_size
     start_frac: float = start_frac
@@ -103,7 +103,7 @@ class KANModel:
     warmup: int = warmup
     n_epochs: int = n_epochs
 
-    def __post_init__(self):        
+    def __post_init__(self):
         self.dl = mb_data_loader(self.X, self.y, self.batch_size)
         data, (n_data, n_feats), self.steps_in_epoch = next(self.dl)
 
@@ -118,11 +118,11 @@ class KANModel:
             warmup_steps=warmup_steps,
             decay_steps=self.steps_in_epoch * self.n_epochs,
             end_value=self.end_frac * self.base_lr,
-        )    
+        )
         self.layer_templ = KANLayer(
             1,
-            1,            
-            dropout_rate=self.node_dropout,            
+            1,
+            dropout_rate=self.node_dropout,
             spline_input_map=lambda x: nn.tanh(x * 0.8),
         )
 
@@ -135,20 +135,20 @@ class KANModel:
         self.sample_X = jnp.ones((self.batch_size, n_feats))
 
     def fit(self):
-        param_state, dropout_state = jr.split(jr.key(np.random.randint(0, 1000)), 2)        
-        state = create_train_state(self.kan, param_state, sched=self.sched, 
+        param_state, dropout_state = jr.split(jr.key(np.random.randint(0, 1000)), 2)
+        state = create_train_state(self.kan, param_state, sched=self.sched,
                                    weight_decay=self.weight_decay, nesterov=self.nesterov,
-                                   sample_X=self.sample_X)        
-                
+                                   sample_X=self.sample_X)
+
         ema_params = state.params
         for _epoch_i in range(self.n_epochs):
             losses = []
             for _i, batch in zip(range(self.steps_in_epoch), self.dl):
-                grad, loss, updates, out = apply_model(state, batch, training=True, dropout_key=dropout_state)                
+                grad, loss, updates, out = apply_model(state, batch, training=True, dropout_key=dropout_state)
                 losses.append(loss)
                 state = step(state, grad, updates)
-                ema_params = jax.tree_map(lambda x, y: self.gamma * x + (1 - self.gamma) * y, 
-                                          ema_params, state.params)  
+                ema_params = jax.tree_map(lambda x, y: self.gamma * x + (1 - self.gamma) * y,
+                                          ema_params, state.params)
             # print(jnp.mean(jnp.array(losses)))
 
         self.ema_state = state.replace(params=ema_params)
@@ -158,12 +158,12 @@ class KANModel:
             self.kan,
             sched=self.sched,
             weight_decay=self.weight_decay,
-            nesterov=self.nesterov,            
+            nesterov=self.nesterov,
             gamma=self.gamma,
             train_dl=self.dl
         )
         self.ema_state = ema_state
-    
+
     def predict(self, X_data, y_data=None):
         if y_data is None:
             y_data = jnp.ones(X_data.shape[0])
@@ -171,8 +171,8 @@ class KANModel:
         data, (n_data, n_feats), steps_in_epoch = next(test_dl)
         batch = next(test_dl)
         grad, loss, updates, out = apply_model(self.ema_state, batch, training=False, dropout_key=jr.key(0))
-        
-        yhat = np.array(out).reshape(-1)        
+
+        yhat = np.array(out).reshape(-1)
         yhat = yhat[batch.mask]
 
         return yhat
@@ -200,18 +200,21 @@ if __name__ == '__main__':
             print(f'fold no: {fold}')
             train_inputs, train_outputs = task.get_train_and_val_data(fold)
             test_inputs = task.get_test_data(fold, include_target=False)
-            model = KANModel(train_inputs, train_outputs) 
+            model = KANModel(train_inputs, train_outputs)
 
             # debug_stat(jnp.abs(sample_out.squeeze() - sample_batch.y))
             # debug_structure(sample_out)
-            # debug_structure(params)            
+            # debug_structure(params)
 
             # dl = mb_data_loader(train_inputs, train_outputs, 30)
-            # data, data_sh, sie = next(dl) 
+            # data, data_sh, sie = next(dl)
             # print(data.mean(), data.std())
-            # print(df.values.mean(), df.values.std())            
+            # print(df.values.mean(), df.values.std())
 
-            model.fit_alt()
+            model.fit()
+            with open("model.pkl", 'wb') as out:
+                pickle.dump(model.ema_state.params, out)
+            break
             train_hat = model.predict(train_inputs, train_outputs)
             print(jnp.mean(jnp.abs(train_hat.reshape(-1) - train_outputs.values.reshape(-1))))
             predictions = model.predict(test_inputs)

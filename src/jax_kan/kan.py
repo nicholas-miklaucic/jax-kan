@@ -14,7 +14,7 @@ from eins import Reductions as R
 from flax import linen as nn
 from jaxtyping import Array, Float
 
-from jax_kan.spline import BSpline, Jacobi
+from jax_kan.spline import BSpline, Chebyshev, Jacobi
 from jax_kan.typing_utils import class_tcheck, tcheck
 from jax_kan.utils import flax_summary
 
@@ -26,7 +26,7 @@ class KANLayer(nn.Module):
     order: int = 2
     n_coef: int = 5
     dropout_rate: float = 0.0
-    kernel_init: Callable = nn.initializers.normal(stddev=1)
+    kernel_init: Callable = nn.initializers.normal(stddev=0.03)
     resid_scale_trainable: bool = False
     resid_scale_init: Callable = nn.initializers.ones
     spline_scale_trainable: bool = False
@@ -34,13 +34,17 @@ class KANLayer(nn.Module):
     base_act: Callable = nn.tanh
     spline_input_map: Callable = jnp.tanh
     knots: Float[Array, ' grid'] = field(default_factory=lambda: jnp.array([-1, -0.5, 0, 0.5, 1]))
+    alpha: Optional[float] = None
 
     def setup(self):
         self.size = self.in_dim * self.out_dim
         self.grid = self.knots
 
         # -1 < α < 1 are reasonable bounds, and 0 is Legendre
-        self.alpha_arctanh = self.param('alpha_arctanh', nn.initializers.zeros, ())
+        if self.alpha is None:
+            self.alpha_arctanh = self.param('alpha_arctanh', nn.initializers.zeros, ())
+        else:
+            self.alpha_arctanh = jnp.arctanh(self.alpha)
 
         # self.spline = BSpline(self.grid, self.order)
         self.coefs = nn.Einsum((self.in_dim, self.out_dim, self.n_coef), 'ic,ioc->io', use_bias=False)
@@ -59,6 +63,7 @@ class KANLayer(nn.Module):
 
     def __call__(self: Self, x: Float[Array, 'in_dim'], training: bool = False) -> Float[Array, ' out_dim']:
         alpha = jnp.tanh(self.alpha_arctanh)
+        # spline = Chebyshev(n_coefs=self.n_coef)
         spline = Jacobi(alpha=alpha, beta=alpha, n_coefs=self.n_coef)
 
         dm = jax.vmap(spline.design_matrix)(self.spline_input_map(x))

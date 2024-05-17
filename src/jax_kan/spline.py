@@ -98,7 +98,13 @@ class Chebyshev(BSpline):
         return self._n_coefs
 
     def design_matrix(self, x: Float[Array, '']) -> Float[Array, 'coefs={self.n_coefs}']:
-        return C.chebval(x, jnp.ones(self.n_coefs))
+        # x0 = jnp.ones_like(x, dtype=x.dtype)[None]
+        polys = [1, x]
+
+        for _n in range(2, self.n_coefs):
+            # https://www.wikiwand.com/en/Chebyshev_polynomials#Recurrence_definition
+            polys.append(2 * x * polys[-1] - polys[-2])
+        return jnp.array(polys[: self.n_coefs])
 
 
 class Jacobi(Chebyshev):
@@ -109,7 +115,7 @@ class Jacobi(Chebyshev):
         self.alpha = alpha
         self.beta = beta
 
-        # self.scaling = jnp.abs(jnp.max(jax.vmap(self._design_matrix)(jnp.linspace(-1, 1, 8))))        
+        # self.scaling = jnp.max(jnp.abs(jax.vmap(self._design_matrix)(jnp.linspace(-1, 1, 8))))
         self.scaling = 1
 
     def _design_matrix(self, x: Float[Array, '']) -> Float[Array, 'coefs={self.n_coefs}']:
@@ -133,6 +139,6 @@ class Jacobi(Chebyshev):
             polys.append(coef1 * polys[-1] - coef2 * polys[-2])
 
         return jnp.array(polys[: self.n_coefs])
-    
+
     def design_matrix(self, x: Float[Array, '']) -> Float[Array, 'coefs={self.n_coefs}']:
         return self._design_matrix(x) / self.scaling

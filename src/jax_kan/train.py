@@ -1,4 +1,5 @@
 import functools as ft
+import pickle
 import time
 from collections.abc import Mapping, Sequence
 from random import shuffle
@@ -38,21 +39,22 @@ start_frac = 0.8
 end_frac = 0.2
 nesterov = True
 warmup = 10
-n_epochs = 200
+n_epochs = 500
 dtype = jnp.float32
 optimize = False
 
-n_coef = 5
-node_dropout = 0.3
+n_coef = 4
+node_dropout = 0
 order = 3
 spline_input_map = lambda x: nn.tanh(x * 0.8)
 hidden_dim = None
-inner_dims = [512, 128, 64]
+inner_dims = [32, 32]
 normalization = Identity
 base_act = nn.tanh
 weight_decay = 0
-base_lr = 6e-3
-gamma = 0.997
+base_lr = 4e-3
+gamma = 0.99
+alpha = None
 
 # -------------------------------
 
@@ -170,7 +172,10 @@ def create_train_state(model: nn.Module, rng, sched, weight_decay=0, nesterov=Tr
         sample_X = sample_batch.X
     model_state = model.init(rng, sample_X, training=False)
     params = model_state.pop('params')
-    tx = optax.adamw(sched, weight_decay=weight_decay, nesterov=nesterov)
+    tx = optax.chain(
+        optax.adamw(sched, weight_decay=weight_decay, nesterov=nesterov),
+        optax.clip_by_global_norm(max_norm=3.0),
+    )
     return TrainState.create(apply_fn=model.apply, params=params, tx=tx, **model_state)
 
 
@@ -313,7 +318,7 @@ if __name__ == '__main__':
                 dims.append(int(round(mult * dims[-1])))
 
         spline_input_map = lambda x, scale=spline_input_scale: jnp.tanh(x * scale)
-        
+
 
         kwargs = {
             'n_coef': n_coef,
@@ -385,7 +390,7 @@ if __name__ == '__main__':
     from rich.logging import RichHandler
 
 
-    
+
     if optimize:
         optuna.logging.get_logger("optuna").addHandler(RichHandler(console=console))
         study = optuna.create_study(pruner=optuna.pruners.MedianPruner())
@@ -404,6 +409,7 @@ if __name__ == '__main__':
                 dropout_rate=node_dropout,
                 base_act=base_act,
                 spline_input_map=spline_input_map,
+                alpha=alpha,
             ),
         }
 
@@ -419,13 +425,13 @@ if __name__ == '__main__':
 
         sample_out, params = kan.init_with_output(jr.key(0), sample_batch.X)
 
-        print(steps_in_epoch)        
+        print(steps_in_epoch)
 
         # debug_stat(jnp.abs(sample_out.squeeze() - sample_batch.y))
         # debug_structure(sample_out)
         # debug_structure(params)
 
-        flax_summary(kan, x=sample_batch.X, compute_flops=True, compute_vjp_flops=True)        
+        flax_summary(kan, x=sample_batch.X, compute_flops=True, compute_vjp_flops=True)
 
         table_df = []
         table = Table(title='Run')
@@ -435,7 +441,9 @@ if __name__ == '__main__':
         table.add_column('Best Validation', justify='right', style='green')
 
 
-        for fold in range(n_folds):
+
+        # for fold in range(n_folds):
+        for fold in [0]:
             kan = KAN(in_dim=sample_batch.X.shape[-1], out_dim=1, final_act=target_transforms[target], **kwargs)
             ema_state, kan_epochs, duration = train_model(
                 kan,
@@ -446,11 +454,16 @@ if __name__ == '__main__':
                 gamma=gamma
             )
 
+            if fold == 0:
+                with open(f'model.pkl', 'wb') as f:
+                    pickle.dump(ema_state.params, f)
+
             # ema_params = jax.tree_map(lambda *xs: jnp.mean(ema_gamma * xs, axis=0), *[state.params for state in kan_states])
 
             losses = []
             for batch in data_loader(fold=fold, split='valid', infinite=False):
                 grad, loss, updates, out = apply_model(ema_state, batch, training=False, dropout_key=jr.key(0))
+                debug_stat(jax.tree_map(jnp.abs, grad))
                 losses.append(loss)
 
             best_valid = np.mean(losses).item()

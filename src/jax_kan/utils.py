@@ -264,6 +264,7 @@ def flax_summary(
     column_kwargs=MappingProxyType({'justify': 'right'}),
     show_repeated=False,
     depth=None,
+    colorize=True,
     **kwargs,
 ):
     out = mod.tabulate(
@@ -287,7 +288,7 @@ def flax_summary(
     nums = re.findall(r'\d' * 4 + '+', out)
     color_max = max(len(n) for n in nums) + 1
 
-    def colorize(m: re.Match):
+    def _colorize(m: re.Match):
         s = m.group(0)
 
         n = int(s.strip())
@@ -310,7 +311,8 @@ def flax_summary(
         pad_num = len(m.group(0)) - len(human)
         return ' ' * pad_num + human
 
-    out = re.sub(r'\d' * 4 + '+', colorize, out)
+    if colorize:
+        out = re.sub(r'\d' * 4 + '+', _colorize, out)
     out = re.sub(r'\d' * 6 + '+', human_units, out)
 
     print(out)
