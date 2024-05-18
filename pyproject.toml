@@ -132,6 +132,8 @@ ignore = [
   # boolean arguments are fine
   "FBT001",
   "FBT002",
+  # caps names are common in machine learning
+  "N803",
 ]
 unfixable = [
   # Don't touch unused imports

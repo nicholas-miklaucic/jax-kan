@@ -5,7 +5,7 @@ import numpy as np
 from jax_kan.kan import KAN, KANLayer
 import optax
 import flax.linen as nn
-from jax_kan.train import TrainBatch, apply_model, create_train_state, step, df, target_transforms, train_model
+from jax_kan.train import DataBatch, apply_model, create_train_state, step, df, target_transforms, train_model
 from jax_kan.utils import Identity, flax_summary
 import jax
 import jax.random as jr
@@ -14,7 +14,25 @@ from dataclasses import dataclass
 import pandas as pd
 import matminer
 from pymatgen.core import Composition
-from jax_kan.train import n_coef, node_dropout, order, spline_input_map, hidden_dim, inner_dims, normalization, base_act, weight_decay, base_lr, gamma, nesterov, start_frac, end_frac, batch_size, n_epochs, warmup
+from jax_kan.train import (
+    n_coef,
+    node_dropout,
+    order,
+    spline_input_map,
+    hidden_dim,
+    inner_dims,
+    normalization,
+    base_act,
+    weight_decay,
+    base_lr,
+    gamma,
+    nesterov,
+    start_frac,
+    end_frac,
+    batch_size,
+    n_epochs,
+    warmup,
+)
 
 from matminer.featurizers.base import MultipleFeaturizer
 import matminer.featurizers.composition as cf
@@ -22,12 +40,14 @@ import matminer.featurizers.composition as cf
 preset = cf.ElementProperty.from_preset('magpie')
 megnet = cf.ElementProperty.from_preset('megnet_el')
 
-feats = MultipleFeaturizer([
-    cf.ElementProperty(preset.data_source, preset.features, stats=['mean', 'avg_dev', 'minimum', 'maximum']),
-    cf.ElementProperty(megnet.data_source, megnet.features, stats=['mean', 'avg_dev', 'minimum', 'maximum']),
-    cf.Miedema(),
-    cf.WenAlloys()
-])
+feats = MultipleFeaturizer(
+    [
+        cf.ElementProperty(preset.data_source, preset.features, stats=['mean', 'avg_dev', 'minimum', 'maximum']),
+        cf.ElementProperty(megnet.data_source, megnet.features, stats=['mean', 'avg_dev', 'minimum', 'maximum']),
+        cf.Miedema(),
+        cf.WenAlloys(),
+    ]
+)
 
 columns = df.columns[:-1]
 
@@ -71,7 +91,7 @@ def mb_data_loader(X_data, y_data, batch_size, infinite=True, shuffle=True, emul
     data_batches = jnp.split(data, n_splits)
     mas_batches = jnp.split(mas, n_splits)
 
-    batches = [TrainBatch(X=d[..., :-1], y=d[..., -1], mask=m) for d, m in zip(data_batches, mas_batches)]
+    batches = [DataBatch(X=d[..., :-1], y=d[..., -1], mask=m) for d, m in zip(data_batches, mas_batches)]
 
     first_time = True
     while first_time or infinite:
@@ -127,18 +147,29 @@ class KANModel:
         )
 
         self.kan = KAN(
-            in_dim=n_feats, out_dim=1, final_act=target_transforms['yield_featurized'],
-            n_coef=self.n_coef, hidden_dim=self.hidden_dim, normalization=self.normalization,
-            out_hidden_dim=1, layer_templ=self.layer_templ, inner_dims=self.inner_dims
+            in_dim=n_feats,
+            out_dim=1,
+            final_act=target_transforms['yield_featurized'],
+            n_coef=self.n_coef,
+            hidden_dim=self.hidden_dim,
+            normalization=self.normalization,
+            out_hidden_dim=1,
+            layer_templ=self.layer_templ,
+            inner_dims=self.inner_dims,
         )
 
         self.sample_X = jnp.ones((self.batch_size, n_feats))
 
     def fit(self):
         param_state, dropout_state = jr.split(jr.key(np.random.randint(0, 1000)), 2)
-        state = create_train_state(self.kan, param_state, sched=self.sched,
-                                   weight_decay=self.weight_decay, nesterov=self.nesterov,
-                                   sample_X=self.sample_X)
+        state = create_train_state(
+            self.kan,
+            param_state,
+            sched=self.sched,
+            weight_decay=self.weight_decay,
+            nesterov=self.nesterov,
+            sample_X=self.sample_X,
+        )
 
         ema_params = state.params
         for _epoch_i in range(self.n_epochs):
@@ -147,8 +178,7 @@ class KANModel:
                 grad, loss, updates, out = apply_model(state, batch, training=True, dropout_key=dropout_state)
                 losses.append(loss)
                 state = step(state, grad, updates)
-                ema_params = jax.tree_map(lambda x, y: self.gamma * x + (1 - self.gamma) * y,
-                                          ema_params, state.params)
+                ema_params = jax.tree_map(lambda x, y: self.gamma * x + (1 - self.gamma) * y, ema_params, state.params)
             # print(jnp.mean(jnp.array(losses)))
 
         self.ema_state = state.replace(params=ema_params)
@@ -160,14 +190,16 @@ class KANModel:
             weight_decay=self.weight_decay,
             nesterov=self.nesterov,
             gamma=self.gamma,
-            train_dl=self.dl
+            train_dl=self.dl,
         )
         self.ema_state = ema_state
 
     def predict(self, X_data, y_data=None):
         if y_data is None:
             y_data = jnp.ones(X_data.shape[0])
-        test_dl = mb_data_loader(X_data, y_data, X_data.shape[0], infinite=False, shuffle=False, emulate_artifacts=False)
+        test_dl = mb_data_loader(
+            X_data, y_data, X_data.shape[0], infinite=False, shuffle=False, emulate_artifacts=False
+        )
         data, (n_data, n_feats), steps_in_epoch = next(test_dl)
         batch = next(test_dl)
         grad, loss, updates, out = apply_model(self.ema_state, batch, training=False, dropout_key=jr.key(0))
@@ -181,6 +213,7 @@ class KANModel:
 if __name__ == '__main__':
     import random
     import numpy as np
+
     # import torch
     # torch.manual_seed(1234)
     # torch.cuda.manual_seed(1234)
@@ -190,10 +223,9 @@ if __name__ == '__main__':
     np.random.seed(1234)
     random.seed(1234)
 
-
-
     from matbench.bench import MatbenchBenchmark
-    mb = MatbenchBenchmark(autoload=False, subset=["matbench_steels"])
+
+    mb = MatbenchBenchmark(autoload=False, subset=['matbench_steels'])
     for task in mb.tasks:
         task.load()
         for fold in task.folds:
@@ -212,7 +244,7 @@ if __name__ == '__main__':
             # print(df.values.mean(), df.values.std())
 
             model.fit()
-            with open("model.pkl", 'wb') as out:
+            with open('model.pkl', 'wb') as out:
                 pickle.dump(model.ema_state.params, out)
             break
             train_hat = model.predict(train_inputs, train_outputs)
@@ -220,4 +252,4 @@ if __name__ == '__main__':
             predictions = model.predict(test_inputs)
             task.record(fold, predictions)
 
-    mb.to_file("results.json.gz")
+    mb.to_file('results.json.gz')

@@ -3,7 +3,7 @@
 import functools as ft
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Self
+from typing import Any, Callable, Optional, Self
 
 import jax
 import jax.numpy as jnp
@@ -19,7 +19,7 @@ from jax_kan.typing_utils import class_tcheck, tcheck
 from jax_kan.utils import flax_summary
 
 
-@class_tcheck
+# @class_tcheck
 class KANLayer(nn.Module):
     in_dim: int
     out_dim: int
@@ -85,7 +85,7 @@ class KAN(nn.Module):
     inner_dims: Sequence[int]
 
     n_coef: int = 5
-    knot_dtype: jnp.dtype = jnp.float32
+    knot_dtype: Any = jnp.float32
     train_knots: bool = True
     layer_dropout_rate: float = 0.0
     hidden_dim: Optional[int] = None
@@ -102,8 +102,8 @@ class KAN(nn.Module):
         out_dim = self.out_hidden_dim or self.out_dim
         out_dims = (*self.inner_dims, out_dim)
 
-        knot_init = np.linspace(-1, 1, self.n_coef, dtype=self.knot_dtype)
-        knot_init = np.sign(knot_init) * np.sqrt(np.abs(knot_init))
+        knot_init = jnp.linspace(-1, 1, self.n_coef, dtype=self.knot_dtype)
+        knot_init = jnp.sign(knot_init) * jnp.sqrt(jnp.abs(knot_init))
         self.knots = knot_init
 
         for out_dim in out_dims:
