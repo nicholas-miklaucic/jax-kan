@@ -1,14 +1,16 @@
 """Data loading/training pipeline."""
 
 from collections.abc import Iterable, Sequence
-from typing import Optional, Self
-from flax import struct
-import jax
-from jaxtyping import Float, Array, Bool, Int
 from dataclasses import dataclass
+from typing import Optional, Self
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
+from flax import struct
+from jaxtyping import Array, Bool, Float, Int, Shaped
+
 from jax_kan.typing_utils import class_tcheck
 from jax_kan.utils import debug_structure
 
@@ -39,9 +41,9 @@ class DataBatch:
     """A (potentially padded/masked) batch of data."""
 
     # Input.
-    X: Float[Array, 'batch in_dim']
+    X: Shaped[Array, 'batch in_dim']
     # Output.
-    y: Float[Array, ' batch']
+    y: Shaped[Array, ' batch']
     mask: Bool[Array, ' batch']
 
     def as_dict(self):
@@ -56,7 +58,7 @@ class DataBatch:
         return self.X.shape[1]
 
     @classmethod
-    def new(cls, X: Float[Array, 'size in_dim'], y: Float[Array, ' size'], batch_size: Optional[int] = None) -> Self:
+    def new(cls, X: Shaped[Array, 'size in_dim'], y: Shaped[Array, ' size'], batch_size: Optional[int] = None) -> Self:
         """Pads the inputs to the given size if necessary."""
         if batch_size is None:
             return cls(X=X, y=y, mask=jnp.ones(X.shape[0], dtype=jnp.bool))
@@ -65,10 +67,10 @@ class DataBatch:
             return cls(X=X, y=y, mask=mask)
 
     @classmethod
-    def new_empty(cls, batch: int, in_dim: int, dtype=jnp.float32) -> Self:
+    def new_empty(cls, batch: int, in_dim: int, X_dtype=jnp.float32, y_dtype=jnp.float32) -> Self:
         return cls(
-            X=jnp.zeros((batch, in_dim), dtype=dtype),
-            y=jnp.zeros((batch,), dtype=dtype),
+            X=jnp.zeros((batch, in_dim), dtype=X_dtype),
+            y=jnp.zeros((batch,), dtype=y_dtype),
             mask=jnp.ones((batch,), dtype=jnp.bool),
         )
 
@@ -87,6 +89,11 @@ class DataBatch:
             chunks.append(DataBatch(X=X[i:j], y=y[i:j], mask=mask[i:j]))
 
         return tuple(chunks)
+
+    def masked_mean(self, vals):
+        mask_w = self.mask.astype(float)
+        mask_w = mask_w / jnp.sum(mask_w)
+        return jnp.dot(vals, mask_w)
 
 
 class AbstractDataLoader:
@@ -114,6 +121,7 @@ class DataFrameDataLoader(AbstractDataLoader):
     batch_size: int
     target_col: str
     shuffle_seed: Optional[int] = 42
+    standardize: bool = True
     exclude_cols: Sequence[str] = ()
 
     def __post_init__(self):
@@ -123,6 +131,7 @@ class DataFrameDataLoader(AbstractDataLoader):
         X_df = self.df.drop(columns=list(self.exclude_cols))
         y = jnp.array(X_df.pop(self.target_col).values)
         X = jnp.array(X_df.values)
+        X = jax.nn.standardize(X, axis=0) if self.standardize else X
 
         self.dataset = DataBatch.new(X, y, self.batch_size)
 
@@ -131,7 +140,9 @@ class DataFrameDataLoader(AbstractDataLoader):
         return self.dataset.size // self.batch_size
 
     def sample_batch(self) -> DataBatch:
-        return DataBatch.new_empty(self.batch_size, self.dataset.in_dim)
+        return DataBatch.new_empty(
+            self.batch_size, self.dataset.in_dim, X_dtype=self.dataset.X.dtype, y_dtype=self.dataset.y.dtype
+        )
 
     def epoch_batches(self) -> Iterable[DataBatch]:
         if self.shuffle_seed is not None:
@@ -158,7 +169,8 @@ class DataFrameDataLoader(AbstractDataLoader):
 if __name__ == '__main__':
     from tqdm import tqdm
 
-    df = pd.read_feather('datasets/mb_expt_gap.feather')
+    df = pd.read_csv('datasets/one-hundred-plants.csv', index_col='id')
+    df['Class'] = df['Class'].astype(int)
     dl = DataFrameDataLoader(
         df=df,
         batch_size=8,

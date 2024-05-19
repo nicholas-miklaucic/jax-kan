@@ -1,16 +1,9 @@
 """Trainer interface."""
 
-from typing import Callable
-from flax import linen as nn
-from flax.training import train_state
-import functools as ft
-import jax
-import optax
-import jax.random as jr
-import jax.numpy as jnp
 import functools as ft
 import pickle
 import time
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from random import shuffle
 from typing import Any, Callable
@@ -27,16 +20,18 @@ import rich
 import rich.progress as rprog
 from eins import EinsOp
 from eins import ElementwiseOps as E
+from flax import linen as nn
 from flax import struct
 from flax.training import train_state
 from jaxtyping import Array, Bool, Float
 from rich.progress import Progress, track
 from rich.progress_bar import ProgressBar
-
-from jax_kan.kan import KAN, KANLayer
-from jax_kan.utils import Identity, debug_stat, debug_structure, flax_summary
+from sklearn.metrics import roc_auc_score
 
 from jax_kan.data import AbstractDataLoader, DataBatch, DataFrameDataLoader
+from jax_kan.function_basis import InputMap
+from jax_kan.kan import KAN, KANLayer
+from jax_kan.utils import Identity, debug_stat, debug_structure, flax_summary
 
 
 class TrainState(train_state.TrainState):
@@ -52,14 +47,12 @@ class Trainer:
         data: DataFrameDataLoader,
         optimizer: optax.GradientTransformation,
         rng=None,
-        loss_fn: Callable = lambda x, y: jnp.mean(jnp.abs(x - y)),
         show_progress: bool = True,
         show_subprogress: bool = False,
     ):
         self.model = model
         self.data = data
         self.optimizer = optimizer
-        self.loss_fn = loss_fn
         self.show_progress = show_progress
         self.show_subprogress = show_subprogress
 
@@ -96,8 +89,10 @@ class Trainer:
                     yhat = out
                     updates = {}
 
-                err = self.loss_fn(jnp.squeeze(yhat, -1), batch.y) * batch.mask
-                return jnp.sum(err) / jnp.sum(batch.mask), (updates, out)
+                # debug_stat(yhat=yhat, y=batch.y)
+
+                err = optax.softmax_cross_entropy_with_integer_labels(yhat, batch.y) * batch.mask
+                return batch.masked_mean(err), (updates, yhat)
 
             grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
             (loss, (updates, out)), grad = grad_fn(state.params)
@@ -140,14 +135,22 @@ class Trainer:
 
             for epoch_i in range(n_epochs):
                 epoch_bar = prog.add_task(f'Train {epoch_i}...', total=steps_in_epoch, visible=self.show_subprogress)
-                values = {'train_loss': [], 'grad_norm': [], 'valid_loss': []}
+                values = defaultdict(list)
                 for batch in self.train_data.epoch_batches():
                     grad, loss, updates, out = self.apply_model(
-                        self.state, batch, training=True, dropout_key=dropout_state
+                        self.state,
+                        batch,
+                        training=True,
+                        dropout_key=dropout_state,
                     )
 
                     # debug_stat(grad)
+
                     values['train_loss'].append(loss)
+                    values['train_acc'].append(batch.masked_mean(jnp.argmax(out, -1) == batch.y))
+                    values['train_rmse'].append(
+                        jnp.sqrt(batch.masked_mean(1 - jnp.take(out, batch.y[:, None]).squeeze() ** 2))
+                    )
                     values['grad_norm'].append(optax.global_norm(grad))
                     self.state = self.take_step(self.state, grad, updates)
                     prog.update(epoch_bar, advance=1)
@@ -157,15 +160,23 @@ class Trainer:
                 )
                 for batch in self.valid_data.epoch_batches():
                     grad, loss, updates, out = self.apply_model(
-                        self.state, batch, training=False, dropout_key=dropout_state
+                        self.state,
+                        batch,
+                        training=False,
+                        dropout_key=dropout_state,
                     )
                     values['valid_loss'].append(loss)
+                    values['valid_acc'].append(batch.masked_mean(jnp.argmax(out, -1) == batch.y))
+                    values['valid_rmse'].append(
+                        jnp.sqrt(batch.masked_mean(1 - jnp.take(out, batch.y[:, None]).squeeze() ** 2))
+                    )
                     prog.update(valid_bar, advance=1)
 
                 prog.update(epoch_bar, visible=False, completed=True)
                 prog.update(valid_bar, visible=False, completed=True)
 
-                epoch_row = {k: float(np.mean(v)) for k, v in values.items()}
+                aggfuncs = {'grad_norm': np.max}
+                epoch_row = {k: float(aggfuncs.get(k, np.mean)(v)) for k, v in values.items()}
                 epoch_row['epoch'] = self.epoch
                 epoch_df.append(epoch_row)
                 self.epoch += 1
@@ -188,96 +199,59 @@ class Trainer:
 
 
 if __name__ == '__main__':
-    target = 'expt_gap'
-    loss_norm_fn = jnp.abs
-    dataset_splits = (3, 4, 5, 6, 7)
+    # jax.config.update('jax_debug_nans', True)
     batch_size = 16
-    use_prodigy = False
     n_folds = 5
     start_frac = 0.8
     end_frac = 0.2
-    nesterov = True
     warmup = 10
     n_epochs = 300
     dtype = jnp.float32
-    optimize = False
 
     n_coef = 4
     node_dropout = 0
-    order = 3
-    spline_input_map = lambda x: nn.tanh(x * 0.8)
     hidden_dim = None
     inner_dims = [32, 32]
     normalization = Identity
     base_act = nn.tanh
     weight_decay = 0.03
     base_lr = 4e-3
-    gamma = 0.99
-    alpha = None
+    input_map = InputMap(
+        stretch_base=1,
+        stretch_trainable=False,
+        map_type='tanh',
+    )
 
     # -------------------------------
 
-    target_transforms = {
-        'bandgap': lambda x: x,
-        'yield_raw': E.from_func(lambda x: E.expm1(x + 7.5)),
-        'delta_e': lambda x: x * 4,
-        'expt_gap': nn.elu,
-    }
-
-    target_transforms['yield_featurized'] = target_transforms['yield_raw']
-
-    if target in ('bandgap', 'delta_e'):
-        df = pd.read_feather('datasets/mpc_full_feats_scaled_split.feather')
-        df = df[df['dataset_split'].isin(dataset_splits)]
-        df = df.select_dtypes('number').drop(columns=['TSNE_x', 'TSNE_y', 'umap_x', 'umap_y', 'dataset_split'])
-    elif target == 'yield_raw':
-        df = pd.read_feather('datasets/steels_raw.feather')
-    elif target == 'yield_featurized':
-        df = pd.read_feather('datasets/steels_featurized.feather')
-    elif target == 'expt_gap':
-        df = pd.read_feather('datasets/mb_expt_gap.feather')
-    else:
-        msg = f'Unknown target: {target}'
-        raise ValueError(msg)
-
-    dl = DataFrameDataLoader(df, batch_size=batch_size, target_col=df.columns[-1])
+    df = pd.read_csv('datasets/one-hundred-plants.csv', index_col='id')
+    df['Class'] = df['Class'].astype(int)
+    dl = DataFrameDataLoader(df, batch_size=batch_size, target_col='Class')
 
     steps_in_epoch = 4 * dl.num_batches // 5
 
     kwargs = {
-        'n_coef': n_coef,
+        'in_dim': dl.sample_batch().in_dim,
+        'out_dim': max(dl.dataset.y.tolist()) + 1,
+        'final_act': lambda x: x,
         'inner_dims': inner_dims,
         'normalization': normalization,
         'hidden_dim': hidden_dim,
-        'out_hidden_dim': 1,
-        'layer_templ': KANLayer(
-            1,
-            1,
-            order=order,
-            dropout_rate=node_dropout,
-            base_act=base_act,
-            spline_input_map=spline_input_map,
-            alpha=alpha,
-        ),
+        'out_hidden_dim': None,
+        'layer_templ': KANLayer(1, 1, n_coef=n_coef, dropout_rate=node_dropout, base_act=base_act, input_map=input_map),
     }
 
     sched = optax.cosine_onecycle_schedule(
         transition_steps=steps_in_epoch * n_epochs,
-        peak_value=1 if use_prodigy else base_lr,
+        peak_value=base_lr,
         pct_start=0.1,
         div_factor=1 / start_frac,
         final_div_factor=1 / end_frac,
     )
-    if use_prodigy:
-        opt = optax.contrib.prodigy(sched, weight_decay=weight_decay)
-    else:
-        opt = optax.adamw(sched, weight_decay=weight_decay, nesterov=nesterov)
-    tx = optax.chain(
-        opt,
-        optax.clip_by_global_norm(max_norm=3.0),
-    )
+    opt = optax.nadamw(sched, weight_decay=weight_decay)
+    tx = optax.chain(opt)
 
-    kan = KAN(in_dim=dl.sample_batch().in_dim, out_dim=1, final_act=target_transforms[target], **kwargs)
+    kan = KAN(**kwargs)
 
     trainer = Trainer(kan, dl, optimizer=tx)
 
