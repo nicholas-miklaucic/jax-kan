@@ -49,8 +49,17 @@ class KANLayer(nn.Module):
         shape = () if self.spline_params_share else (self.in_dim,)
         self.spline_params = {name: self.param(name, init, shape) for name, init in params.items()}
 
+        def custom_kernel_init(key, shape, dtype=jnp.float32):
+            i, o, c = shape
+            return jnp.concat([self.kernel_init(key, (i, o, 1), dtype), nn.zeros(key, (i, o, c - 1), dtype)], axis=-1)
+
         # self.spline = BSpline(self.grid, self.order)
-        self.coefs = nn.Einsum((self.in_dim, self.out_dim, self.n_coef), 'ic,ioc->io', use_bias=self.use_bias)
+        self.coefs = nn.Einsum(
+            (self.in_dim, self.out_dim, self.n_coef),
+            'ic,ioc->io',
+            use_bias=self.use_bias,
+            kernel_init=custom_kernel_init,
+        )
 
         if self.resid_scale_trainable:
             self.resid_scale = self.param('resid_scale', self.resid_scale_init, (self.in_dim, 1))
@@ -64,7 +73,9 @@ class KANLayer(nn.Module):
 
         self.dropout = nn.Dropout(self.dropout_rate)
 
-    def __call__(self: Self, x: Float[Array, 'in_dim'], training: bool = False) -> Float[Array, ' out_dim']:
+    def __call__(
+        self: Self, x: Float[Array, 'in_dim'], training: bool = False, n_eff_coefs=1.0
+    ) -> Float[Array, ' out_dim']:
         # spline = Chebyshev(n_coefs=self.n_coef)
 
         def design_matrix(x, params):
@@ -77,7 +88,11 @@ class KANLayer(nn.Module):
             in_axes = (0, 0)
         dm = jax.vmap(design_matrix, in_axes=in_axes)(self.input_map(x, self.spline_kind), self.spline_params)
         # in coefs
-        y = self.coefs(dm)
+        if not training:
+            n_eff_coefs = 1
+
+        coef_mask = jnp.linspace(0, 0.85, self.n_coef) <= n_eff_coefs
+        y = self.coefs(dm * coef_mask)
         # in_dim, out_dim
         y = self.resid_scale * self.base_act(x[..., None]) + self.spline_scale * y
         y = self.dropout(y, deterministic=not training)
@@ -96,7 +111,7 @@ class KAN(nn.Module):
     layer_dropout_rate: float = 0.0
     hidden_dim: Optional[int] = None
     out_hidden_dim: Optional[int] = None
-    normalization: type[nn.Module] = nn.LayerNorm
+    normalization: type[nn.Module] | Callable[[], nn.Module] = nn.LayerNorm
     layer_templ: KANLayer = KANLayer(in_dim=1, out_dim=1)
     final_act: Callable = lambda x: x
 
@@ -129,18 +144,22 @@ class KAN(nn.Module):
         self.dropouts = dropouts
         self.network = nn.Sequential(self.layers)
 
-    def single_output(self, x: Float[Array, 'in_dim'], training: bool = False) -> Float[Array, ' out_dim']:
+    def single_output(
+        self, x: Float[Array, 'in_dim'], training: bool = False, n_eff_coefs=1.0
+    ) -> Float[Array, ' out_dim']:
         curr_x = self.in_proj(x)
         for layer, norm, dropout in zip(self.layers, self.norms, self.dropouts):
             curr_x = norm(curr_x)
-            curr_x = layer(curr_x, training=training)
+            curr_x = layer(curr_x, training=training, n_eff_coefs=n_eff_coefs)
             curr_x = dropout(curr_x, deterministic=not training)
         y = self.out_proj(curr_x)
         y = self.final_act(curr_x)
         return y
 
-    def __call__(self, x: Float[Array, 'batch in_dim'], training: bool = False) -> Float[Array, ' batch out_dim']:
-        return jax.vmap(lambda single: self.single_output(single, training))(x)
+    def __call__(
+        self, x: Float[Array, 'batch in_dim'], training: bool = False, n_eff_coefs=1.0
+    ) -> Float[Array, ' batch out_dim']:
+        return jax.vmap(lambda single: self.single_output(single, training, n_eff_coefs))(x)
 
 
 if __name__ == '__main__':

@@ -29,7 +29,7 @@ from rich.progress_bar import ProgressBar
 from sklearn.metrics import roc_auc_score
 
 from jax_kan.data import AbstractDataLoader, DataBatch, DataFrameDataLoader
-from jax_kan.function_basis import InputMap
+from jax_kan.function_basis import FixedInputMap, InputMap
 from jax_kan.kan import KAN, KANLayer
 from jax_kan.utils import Identity, debug_stat, debug_structure, flax_summary
 
@@ -49,12 +49,14 @@ class Trainer:
         rng=None,
         show_progress: bool = True,
         show_subprogress: bool = False,
+        coef_ab=(1, 1),
     ):
         self.model = model
         self.data = data
         self.optimizer = optimizer
         self.show_progress = show_progress
         self.show_subprogress = show_subprogress
+        self.coef_ab = coef_ab
 
         if rng is None:
             self.rng = jr.key(np.random.randint(0, 2048))
@@ -71,14 +73,17 @@ class Trainer:
 
         self.state = TrainState.create(apply_fn=self.model.apply, params=params, tx=self.optimizer, **model_state)
 
-        def apply_model(state: TrainState, batch: DataBatch, training: bool, dropout_key):
+        def apply_model(state: TrainState, batch: DataBatch, training: bool, dropout_key, pct_done):
             dropout_train_key = jr.fold_in(key=dropout_key, data=state.step)
+
+            n_eff_coefs = 1 - (1 - pct_done ** self.coef_ab[0]) ** self.coef_ab[1]
 
             def loss_fn(params):
                 out = state.apply_fn(
                     {'params': params},
                     batch.X,
                     training=training,
+                    n_eff_coefs=n_eff_coefs,
                     rngs={'dropout': dropout_train_key},
                     mutable=training,
                 )
@@ -142,15 +147,13 @@ class Trainer:
                         batch,
                         training=True,
                         dropout_key=dropout_state,
+                        pct_done=epoch_i / (n_epochs - 1),
                     )
 
                     # debug_stat(grad)
 
                     values['train_loss'].append(loss)
                     values['train_acc'].append(batch.masked_mean(jnp.argmax(out, -1) == batch.y))
-                    values['train_rmse'].append(
-                        jnp.sqrt(batch.masked_mean(1 - jnp.take(out, batch.y[:, None]).squeeze() ** 2))
-                    )
                     values['grad_norm'].append(optax.global_norm(grad))
                     self.state = self.take_step(self.state, grad, updates)
                     prog.update(epoch_bar, advance=1)
@@ -160,16 +163,10 @@ class Trainer:
                 )
                 for batch in self.valid_data.epoch_batches():
                     grad, loss, updates, out = self.apply_model(
-                        self.state,
-                        batch,
-                        training=False,
-                        dropout_key=dropout_state,
+                        self.state, batch, training=False, dropout_key=dropout_state, pct_done=epoch_i / (n_epochs - 1)
                     )
                     values['valid_loss'].append(loss)
                     values['valid_acc'].append(batch.masked_mean(jnp.argmax(out, -1) == batch.y))
-                    values['valid_rmse'].append(
-                        jnp.sqrt(batch.masked_mean(1 - jnp.take(out, batch.y[:, None]).squeeze() ** 2))
-                    )
                     prog.update(valid_bar, advance=1)
 
                 prog.update(epoch_bar, visible=False, completed=True)
@@ -216,7 +213,7 @@ if __name__ == '__main__':
     base_act = nn.tanh
     weight_decay = 0.03
     base_lr = 4e-3
-    input_map = InputMap(
+    input_map = FixedInputMap(
         stretch_base=1,
         stretch_trainable=False,
         map_type='tanh',
