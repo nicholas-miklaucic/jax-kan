@@ -27,7 +27,7 @@ class KANLayer(nn.Module):
     out_dim: int
     n_coef: int = 5
     dropout_rate: float = 0.0
-    kernel_init: Callable = nn.initializers.normal(stddev=1)
+    kernel_init: Callable = nn.initializers.normal(stddev=0.03)
     resid_scale_trainable: bool = False
     resid_scale_init: Callable = nn.initializers.ones
     spline_kind: type[FunctionBasis] = Jacobi

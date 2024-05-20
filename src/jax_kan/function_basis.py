@@ -177,7 +177,7 @@ class Gegenbauer(Jacobi):
 
 
 class Hermite(FunctionBasis):
-    """Hermite polynomials (probabilist's version.)"""
+    """Hermite polynomials (physicist's version.)"""
 
     def __init__(self, n_coefs: int):
         super().__init__(n_coefs)
@@ -187,12 +187,16 @@ class Hermite(FunctionBasis):
         return self._n_coefs
 
     def design_matrix(self, x: Float[Array, '']) -> Float[Array, 'coefs={self.n_coefs}']:
-        polys = [x, x**2 - 1]
+        polys = [1, 2 * x]
 
-        for n in range(2, self.n_coefs):
-            polys.append(x * polys[-1] - (n - 1) * polys[-2])
+        for n in range(2, self.n_coefs + 1):
+            polys.append(2 * x * polys[-1] - 2 * (n - 1) * polys[-2])
 
-        return jnp.array(polys[: self.n_coefs])
+        nn = jnp.arange(self.n_coefs + 1)
+        # scale = jnp.sqrt(jnp.pi) * 2 ** (n - 1) * jax.scipy.special.gamma(n)
+        scale = jnp.sqrt(jax.scipy.special.factorial(nn) * jnp.sqrt(jnp.pi) * 2 ** (nn))
+
+        return jnp.array(polys[1 : self.n_coefs + 1]) / jnp.sqrt(scale[1 : self.n_coefs + 1])
 
     @classmethod
     def domain(cls) -> tuple[float, float]:
