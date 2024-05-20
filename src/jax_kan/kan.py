@@ -37,6 +37,7 @@ class KANLayer(nn.Module):
     input_map: InputMap = InputMap()
     spline_params_init: Mapping[str, nn.initializers.Initializer] = field(default_factory=dict)
     spline_params_share: bool = False
+    use_bias: bool = False
 
     def setup(self):
         self.size = self.in_dim * self.out_dim
@@ -49,7 +50,7 @@ class KANLayer(nn.Module):
         self.spline_params = {name: self.param(name, init, shape) for name, init in params.items()}
 
         # self.spline = BSpline(self.grid, self.order)
-        self.coefs = nn.Einsum((self.in_dim, self.out_dim, self.n_coef), 'ic,ioc->io', use_bias=True)
+        self.coefs = nn.Einsum((self.in_dim, self.out_dim, self.n_coef), 'ic,ioc->io', use_bias=self.use_bias)
 
         if self.resid_scale_trainable:
             self.resid_scale = self.param('resid_scale', self.resid_scale_init, (self.in_dim, 1))

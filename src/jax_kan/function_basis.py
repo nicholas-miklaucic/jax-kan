@@ -102,6 +102,20 @@ class Chebyshev(FunctionBasis):
         return (-1, 1)
 
 
+class Legendre(FunctionBasis):
+    """Legendre polynomials."""
+
+    def __init__(self, n_coefs):
+        super().__init__(n_coefs)
+
+    def design_matrix(self, x: Float[Array, '']) -> Float[Array, 'coefs={self.n_coefs}']:
+        return Gegenbauer(self.n_coefs, 0).design_matrix(x)
+
+    @classmethod
+    def domain(cls) -> tuple[float, float]:
+        return (-1, 1)
+
+
 def binom(n, k):
     fact = jax.scipy.special.factorial
     return fact(n) / (fact(k) * fact(n - k))
@@ -213,6 +227,12 @@ InputMapType = Literal['tanh', 'sigmoid', 'sin', 'arctan', 'rational']
 class InputMap(nn.Module):
     """Maps unconstrained reals to the domain of a basis function."""
 
+    pass
+
+
+class FixedInputMap(InputMap):
+    """Maps unconstrained reals to the domain of a basis function."""
+
     stretch_base: float = 1
     stretch_trainable: bool = True
     map_type: InputMapType = 'tanh'
@@ -223,10 +243,6 @@ class InputMap(nn.Module):
         else:
             self.stretch = jnp.array(self.stretch_base)
 
-    def inverse(self, x: Float[Array, '']) -> Float[Array, '']:
-        """Returns an inverse of the map: no guarantee this is unique."""
-        raise NotImplementedError
-
     def __call__(self, x: Float[Array, ''], basis: FunctionBasis) -> Float[Array, '']:
         interval = basis.domain()
         if interval == (-jnp.inf, jnp.inf):
@@ -235,7 +251,28 @@ class InputMap(nn.Module):
             a2, b2 = interval
             fn, a1, b1 = interval_maps[self.map_type]
 
-            scale = (a2 - b2) / (a1 - b1)
-            shift = a2 - a1
+            scale = (b2 - a2) / (b1 - a1)
 
-            return fn(x / self.stretch) * scale + shift
+            return (fn(x / self.stretch) - a1) * scale + a2
+
+
+class PolyInputMap(nn.Module):
+    """Maps unconstrained reals to the domain of a basis function."""
+
+    order: int = 3
+
+    def setup(self):
+        self.coefs = self.param('coefs', nn.initializers.normal(stddev=0.1), (self.order,))
+
+    def __call__(self, x: Float[Array, ''], basis: FunctionBasis) -> Float[Array, '']:
+        interval = basis.domain()
+        if interval == (-jnp.inf, jnp.inf):
+            return jnp.tanh(5 * x) * jnp.log1p(jnp.abs(x))
+        else:
+            lo, hi = interval
+
+            raw = jnp.sin(
+                (jnp.pi * x * jnp.polyval(self.coefs, x)) / (x ** (self.order + 1 + (self.order + 1) % 2) + 10)
+            )
+
+            return ((raw + 1) / 2) * (hi - lo) + lo
